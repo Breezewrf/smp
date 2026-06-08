@@ -45,6 +45,7 @@ class CarryBoxCommand(CommandTerm):
     self.metrics["robot_box_error"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["box_progress"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["at_goal"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["placed_at_goal"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["episode_success"] = torch.zeros(self.num_envs, device=self.device)
 
     self._gui_enabled: viser.GuiCheckboxHandle | None = None
@@ -62,16 +63,28 @@ class CarryBoxCommand(CommandTerm):
     robot_err = torch.norm(box_pos[:, :2] - self.robot.data.root_link_pos_w[:, :2], dim=-1)
     progress = self._progress_fraction(box_pos)
     at_goal = (goal_err < self.cfg.success_threshold).float()
-    self.episode_success = torch.maximum(self.episode_success, at_goal)
+    height = box_pos[:, 2] - self._env.scene.env_origins[:, 2]
+    height_ok = torch.abs(height - self.cfg.place_height) < self.cfg.place_height_threshold
+    speed_ok = torch.norm(self.box.data.root_link_lin_vel_w, dim=-1) < self.cfg.place_speed_threshold
+    lift_memory = getattr(self._env, "_carrybox_has_held_lift", None)
+    has_lifted = (
+      lift_memory
+      if isinstance(lift_memory, torch.Tensor) and lift_memory.shape == (self.num_envs,)
+      else torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+    )
+    placed = (goal_err < self.cfg.success_threshold) & height_ok & speed_ok & has_lifted
+    placed_at_goal = placed.float()
+    self.episode_success = torch.maximum(self.episode_success, placed_at_goal)
 
     self.metrics["box_goal_error"] = goal_err
     self.metrics["robot_box_error"] = robot_err
     self.metrics["box_progress"] = progress
     self.metrics["at_goal"] = at_goal
+    self.metrics["placed_at_goal"] = placed_at_goal
     self.metrics["episode_success"] = self.episode_success
 
   def compute_success(self) -> torch.Tensor:
-    return self.metrics["box_goal_error"] < self.cfg.success_threshold
+    return self.metrics["placed_at_goal"] > 0.5
 
   def _resample_command(self, env_ids: torch.Tensor) -> None:
     n = int(env_ids.numel())
@@ -108,6 +121,9 @@ class CarryBoxCommand(CommandTerm):
 
     self.start_pos_w[env_ids] = start_pos
     self.target_pos_w[env_ids] = target_pos
+    lift_memory = getattr(self._env, "_carrybox_has_held_lift", None)
+    if isinstance(lift_memory, torch.Tensor) and lift_memory.shape == (self.num_envs,):
+      lift_memory[env_ids] = False
 
     yaw = torch.empty(n, device=self.device).uniform_(sr.yaw[0], sr.yaw[1])
     quat = quat_from_euler_xyz(
@@ -220,6 +236,9 @@ class CarryBoxCommandCfg(CommandTermCfg):
   robot_name: str = "robot"
   box_name: str = "box"
   success_threshold: float = 0.25
+  place_height: float = 0.18
+  place_height_threshold: float = 0.08
+  place_speed_threshold: float = 0.35
   goal_mode: Literal["relative", "absolute"] = "relative"
   goal_height: float = 0.18
 

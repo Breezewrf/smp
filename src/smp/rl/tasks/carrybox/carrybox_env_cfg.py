@@ -69,6 +69,9 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     debug_vis=True,
     success_threshold=0.25,
   )
+  # Start with a shorter target range. The old 1.2-2.4m range let PPO discover
+  # foot pushes before it learned the harder grasp/lift/carry sequence.
+  cfg.commands["carrybox"].relative_goal_range.distance = (0.35, 1.0)
 
   # --- Observations --------------------------------------------------------
   command_obs = ObservationTermCfg(
@@ -91,18 +94,8 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     params={
       "task_terms": (
         (
-          carrybox_mdp.box_to_goal,
-          1.0,
-          {"command_name": "carrybox", "box_name": "box", "pos_err_scale": 1.2},
-        ),
-        (
-          carrybox_mdp.box_progress,
-          0.8,
-          {"command_name": "carrybox", "box_name": "box"},
-        ),
-        (
           carrybox_mdp.robot_to_box,
-          0.4,
+          0.15,
           {
             "command_name": "carrybox",
             "robot_name": "robot",
@@ -112,7 +105,7 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         ),
         (
           carrybox_mdp.hands_to_box,
-          0.3,
+          0.8,
           {
             "robot_name": "robot",
             "box_name": "box",
@@ -122,14 +115,63 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
           },
         ),
         (
-          carrybox_mdp.box_upright,
-          0.2,
-          {"box_name": "box", "tilt_err_scale": 2.0},
+          carrybox_mdp.held_box_lift,
+          1.2,
+          {
+            "robot_name": "robot",
+            "box_name": "box",
+            "lateral_offset": 0.18,
+            "vertical_offset": 0.03,
+            "pos_err_scale": 8.0,
+            "min_height": 0.45,
+            "height_gate_scale": 14.0,
+          },
         ),
         (
-          carrybox_mdp.box_height,
-          0.2,
-          {"box_name": "box", "target_height": 0.18, "height_err_scale": 10.0},
+          carrybox_mdp.carried_box_progress,
+          1.2,
+          {
+            "command_name": "carrybox",
+            "robot_name": "robot",
+            "box_name": "box",
+            "lateral_offset": 0.18,
+            "vertical_offset": 0.03,
+            "pos_err_scale": 8.0,
+            "min_height": 0.45,
+            "height_gate_scale": 14.0,
+          },
+        ),
+        (
+          carrybox_mdp.carried_box_to_goal,
+          1.0,
+          {
+            "command_name": "carrybox",
+            "robot_name": "robot",
+            "box_name": "box",
+            "lateral_offset": 0.18,
+            "vertical_offset": 0.03,
+            "pos_err_scale": 8.0,
+            "min_height": 0.45,
+            "height_gate_scale": 14.0,
+            "goal_err_scale": 1.8,
+          },
+        ),
+        (
+          carrybox_mdp.place_box_at_goal,
+          0.8,
+          {
+            "command_name": "carrybox",
+            "box_name": "box",
+            "place_height": 0.18,
+            "goal_err_scale": 3.0,
+            "height_err_scale": 12.0,
+            "speed_err_scale": 1.0,
+          },
+        ),
+        (
+          carrybox_mdp.box_upright,
+          0.25,
+          {"box_name": "box", "tilt_err_scale": 2.0},
         ),
       ),
       "ws": 4,
@@ -145,6 +187,31 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     func=carrybox_mdp.box_speed_penalty,
     weight=-0.05,
     params={"box_name": "box", "max_speed": 3.0},
+  )
+  cfg.rewards["ungrasped_box_motion"] = RewardTermCfg(
+    func=carrybox_mdp.ungrasped_box_motion_penalty,
+    weight=-1.5,
+    params={
+      "robot_name": "robot",
+      "box_name": "box",
+      "lateral_offset": 0.18,
+      "vertical_offset": 0.03,
+      "pos_err_scale": 8.0,
+      "speed_threshold": 0.05,
+    },
+  )
+  cfg.rewards["feet_to_box"] = RewardTermCfg(
+    func=carrybox_mdp.feet_to_box_penalty,
+    weight=-1.0,
+    params={
+      "robot_name": "robot",
+      "box_name": "box",
+      "lateral_offset": 0.18,
+      "vertical_offset": 0.03,
+      "hand_pos_err_scale": 8.0,
+      "margin": 0.28,
+      "speed_threshold": 0.05,
+    },
   )
   cfg.rewards["action_rate_l2"] = RewardTermCfg(func=mdp.action_rate_l2, weight=-0.01)
   cfg.rewards["joint_pos_limits"] = RewardTermCfg(
