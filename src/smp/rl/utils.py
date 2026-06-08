@@ -17,6 +17,11 @@ from mjlab.utils.lab_api.math import (
 from smp.pretrain.model import DiffusionDenoiser
 from smp.pretrain.scheduler import DDPMScheduler
 
+ROBOT_FEATURE_DIM = 59
+BOX_FEATURE_DIM = 16
+BOX_FEATURE_START = ROBOT_FEATURE_DIM
+BOX_FEATURE_END = ROBOT_FEATURE_DIM + BOX_FEATURE_DIM
+
 
 def load_denoiser(
   ckpt_path: str,
@@ -223,6 +228,182 @@ class MotionFeatureBuffer:
         ee_pos_local,
         lin_vel_local,
         ang_vel_local,
+      ],
+      dim=-1,
+    )
+
+
+class MotionBoxFeatureBuffer(MotionFeatureBuffer):
+  """75-D carry-box feature buffer.
+
+  The first 59 dimensions are identical to ``MotionFeatureBuffer``. The appended
+  box features match ``scripts/pt_to_npz.py``:
+
+      ``[box_pos(3), box_height(1), box_rot(6), box_lin_vel(3), box_ang_vel(3)]``
+
+  ``box_pos`` is the box-root offset from the robot root, rotated into the last
+  frame's yaw-only anchor. ``box_height`` is env-origin-relative world height.
+  """
+
+  def __init__(
+    self,
+    num_envs: int,
+    window_size: int,
+    num_joints: int,
+    num_ee: int,
+    device: torch.device | str,
+  ) -> None:
+    super().__init__(
+      num_envs=num_envs,
+      window_size=window_size,
+      num_joints=num_joints,
+      num_ee=num_ee,
+      device=device,
+    )
+    self.box_pos_w = torch.zeros(num_envs, window_size, 3, device=self.device)
+    self.box_quat_w = torch.zeros(num_envs, window_size, 4, device=self.device)
+    self.box_quat_w[..., 0] = 1.0
+    self.box_lin_vel_w = torch.zeros(num_envs, window_size, 3, device=self.device)
+    self.box_ang_vel_w = torch.zeros(num_envs, window_size, 3, device=self.device)
+    self.box_height = torch.zeros(num_envs, window_size, 1, device=self.device)
+
+  def reset(
+    self,
+    env_ids: torch.Tensor,
+    root_pos_w: torch.Tensor,
+    root_quat_w: torch.Tensor,
+    root_lin_vel_w: torch.Tensor,
+    root_ang_vel_w: torch.Tensor,
+    ee_pos_w: torch.Tensor,
+    joint_pos: torch.Tensor,
+    joint_vel: torch.Tensor,
+    box_pos_w: torch.Tensor,
+    box_quat_w: torch.Tensor,
+    box_lin_vel_w: torch.Tensor,
+    box_ang_vel_w: torch.Tensor,
+    box_height: torch.Tensor,
+  ) -> None:
+    """Fill robot and box history for ``env_ids``."""
+    super().reset(
+      env_ids,
+      root_pos_w,
+      root_quat_w,
+      root_lin_vel_w,
+      root_ang_vel_w,
+      ee_pos_w,
+      joint_pos,
+      joint_vel,
+    )
+    self.reset_box(
+      env_ids,
+      box_pos_w,
+      box_quat_w,
+      box_lin_vel_w,
+      box_ang_vel_w,
+      box_height,
+    )
+
+  def reset_box(
+    self,
+    env_ids: torch.Tensor,
+    box_pos_w: torch.Tensor,
+    box_quat_w: torch.Tensor,
+    box_lin_vel_w: torch.Tensor,
+    box_ang_vel_w: torch.Tensor,
+    box_height: torch.Tensor,
+  ) -> None:
+    """Fill only box history for ``env_ids``."""
+    if env_ids.numel() == 0:
+      return
+    if box_height.ndim == 2:
+      box_height = box_height.unsqueeze(-1)
+    self.box_pos_w[env_ids] = box_pos_w
+    self.box_quat_w[env_ids] = box_quat_w
+    self.box_lin_vel_w[env_ids] = box_lin_vel_w
+    self.box_ang_vel_w[env_ids] = box_ang_vel_w
+    self.box_height[env_ids] = box_height
+
+  def update(
+    self,
+    root_pos_w: torch.Tensor,
+    root_quat_w: torch.Tensor,
+    root_lin_vel_w: torch.Tensor,
+    root_ang_vel_w: torch.Tensor,
+    ee_pos_w: torch.Tensor,
+    joint_pos: torch.Tensor,
+    joint_vel: torch.Tensor,
+    box_pos_w: torch.Tensor,
+    box_quat_w: torch.Tensor,
+    box_lin_vel_w: torch.Tensor,
+    box_ang_vel_w: torch.Tensor,
+    box_height: torch.Tensor,
+  ) -> None:
+    """Shift left by one and append the current robot + box frame."""
+    super().update(
+      root_pos_w,
+      root_quat_w,
+      root_lin_vel_w,
+      root_ang_vel_w,
+      ee_pos_w,
+      joint_pos,
+      joint_vel,
+    )
+    if box_height.ndim == 1:
+      box_height = box_height.unsqueeze(-1)
+    self.box_pos_w = torch.roll(self.box_pos_w, shifts=-1, dims=1)
+    self.box_quat_w = torch.roll(self.box_quat_w, shifts=-1, dims=1)
+    self.box_lin_vel_w = torch.roll(self.box_lin_vel_w, shifts=-1, dims=1)
+    self.box_ang_vel_w = torch.roll(self.box_ang_vel_w, shifts=-1, dims=1)
+    self.box_height = torch.roll(self.box_height, shifts=-1, dims=1)
+    self.box_pos_w[:, -1] = box_pos_w
+    self.box_quat_w[:, -1] = box_quat_w
+    self.box_lin_vel_w[:, -1] = box_lin_vel_w
+    self.box_ang_vel_w[:, -1] = box_ang_vel_w
+    self.box_height[:, -1] = box_height
+
+  def compute_features(self) -> torch.Tensor:
+    """Return 75-D robot + box features in the carry-box NPZ layout."""
+    robot_features = super().compute_features()
+    N = self.num_envs
+    W = self.window_size
+
+    anchor_quat_T = self.root_quat_w[:, -1]
+    yaw_T = yaw_quat(anchor_quat_T)
+    heading_inv_T_W = quat_conjugate(yaw_T)[:, None, :].expand(N, W, 4)
+    yaw_T_W = yaw_T[:, None, :].expand(N, W, 4).reshape(-1, 4)
+
+    box_offset_w = self.box_pos_w - self.root_pos_w
+    box_pos_local = quat_apply_inverse(
+      yaw_T_W,
+      box_offset_w.reshape(-1, 3),
+    ).reshape(N, W, 3)
+
+    box_rot_local_quat = quat_mul(
+      heading_inv_T_W.reshape(-1, 4),
+      self.box_quat_w.reshape(-1, 4),
+    ).reshape(N, W, 4)
+    box_rot_mat = matrix_from_quat(box_rot_local_quat.reshape(-1, 4)).reshape(
+      N, W, 3, 3
+    )
+    box_rot_6d = torch.cat([box_rot_mat[..., :, 0], box_rot_mat[..., :, 2]], dim=-1)
+
+    box_lin_vel_local = quat_apply_inverse(
+      yaw_T_W,
+      self.box_lin_vel_w.reshape(-1, 3),
+    ).reshape(N, W, 3)
+    box_ang_vel_local = quat_apply_inverse(
+      yaw_T_W,
+      self.box_ang_vel_w.reshape(-1, 3),
+    ).reshape(N, W, 3)
+
+    return torch.cat(
+      [
+        robot_features,
+        box_pos_local,
+        self.box_height,
+        box_rot_6d,
+        box_lin_vel_local,
+        box_ang_vel_local,
       ],
       dim=-1,
     )

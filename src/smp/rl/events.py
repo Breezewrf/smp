@@ -12,7 +12,15 @@ import torch
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.utils.lab_api.math import quat_apply, quat_mul, yaw_quat
 
-from smp.rl.utils import DiffNormalizer, MotionFeatureBuffer, load_denoiser
+from smp.rl.utils import (
+  BOX_FEATURE_END,
+  BOX_FEATURE_START,
+  ROBOT_FEATURE_DIM,
+  DiffNormalizer,
+  MotionBoxFeatureBuffer,
+  MotionFeatureBuffer,
+  load_denoiser,
+)
 from smp.sampling.feature_to_state import (
   EE_BODY_NAMES,
   NUM_EE,
@@ -65,6 +73,13 @@ def init_smp_state(
   model, scheduler, q_low, q_high, feature_dim, window_size = load_denoiser(
     ckpt_path, env.device
   )
+  if feature_dim != ROBOT_FEATURE_DIM:
+    msg = (
+      f"init_smp_state expects a {ROBOT_FEATURE_DIM}-D robot-only checkpoint, "
+      f"got feature_dim={feature_dim}. Use init_smp_box_state for carry-box "
+      f"{BOX_FEATURE_END}-D checkpoints."
+    )
+    raise ValueError(msg)
   model = _maybe_compile(model, compile_model, compile_mode)
   env._smp_bundle = (  # type: ignore[attr-defined]
     model,
@@ -106,6 +121,75 @@ def init_smp_state(
       _ = model(dummy_x, dummy_t)
 
   gsi_reset(env)
+
+
+def init_smp_box_state(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None = None,
+  ckpt_path: str = "",
+  gsi_buffer_size: int = 4096,
+  gsi_batch_size: int = 256,
+  compile_model: bool = True,
+  compile_mode: str | None = None,
+  box_name: str = "box",
+) -> None:
+  """Startup event for 75-D carry-box SMP guidance."""
+  del env_ids
+  if not ckpt_path:
+    msg = (
+      "init_smp_box_state called without `ckpt_path`. Set it to a 75-D "
+      "carry-box denoiser checkpoint."
+    )
+    raise RuntimeError(msg)
+  model, scheduler, q_low, q_high, feature_dim, window_size = load_denoiser(
+    ckpt_path, env.device
+  )
+  if feature_dim != BOX_FEATURE_END:
+    msg = (
+      f"init_smp_box_state expects a {BOX_FEATURE_END}-D carry-box checkpoint, "
+      f"got feature_dim={feature_dim} from {ckpt_path}."
+    )
+    raise ValueError(msg)
+  model = _maybe_compile(model, compile_model, compile_mode)
+  env._smp_bundle = (  # type: ignore[attr-defined]
+    model,
+    scheduler,
+    q_low,
+    q_high,
+    feature_dim,
+    window_size,
+  )
+  robot = env.scene["robot"]
+  env._smp_ee_indexes = torch.tensor(  # type: ignore[attr-defined]
+    robot.find_bodies(list(EE_BODY_NAMES), preserve_order=True)[0],
+    dtype=torch.long,
+    device=env.device,
+  )
+  env._smp_buffer = MotionBoxFeatureBuffer(  # type: ignore[attr-defined]
+    num_envs=env.num_envs,
+    window_size=window_size,
+    num_joints=NUM_JOINTS,
+    num_ee=NUM_EE,
+    device=env.device,
+  )
+  env._smp_normalizer = DiffNormalizer(scheduler.num_timesteps, env.device)  # type: ignore[attr-defined]
+
+  if gsi_buffer_size <= 0:
+    msg = f"gsi_buffer_size must be positive, got {gsi_buffer_size}."
+    raise ValueError(msg)
+  pool_chunks: list[torch.Tensor] = []
+  for start in range(0, gsi_buffer_size, gsi_batch_size):
+    bsz = min(gsi_batch_size, gsi_buffer_size - start)
+    pool_chunks.append(_ddpm_sample(env, bsz))
+  env._smp_gsi_pool = torch.cat(pool_chunks, dim=0)  # type: ignore[attr-defined]
+
+  if compile_model and env.num_envs != gsi_batch_size:
+    with torch.no_grad():
+      dummy_x = torch.randn(env.num_envs, window_size, feature_dim, device=env.device)
+      dummy_t = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+      _ = model(dummy_x, dummy_t)
+
+  gsi_box_reset(env, box_name=box_name)
 
 
 def _prime_sim_and_buffer(
@@ -187,6 +271,115 @@ def _prime_sim_and_buffer(
   )
 
 
+def _prime_sim_and_box_buffer(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  window: torch.Tensor,
+  box_name: str = "box",
+) -> None:
+  """Prime robot + box sim state and the 75-D carry-box feature buffer."""
+  n, W, _ = window.shape
+  E = NUM_EE
+  parts = slice_features(window[..., :ROBOT_FEATURE_DIM])
+  root_pos_local = parts["root_pos"]
+  root_rot_6d = parts["root_rot"]
+  joint_pos = parts["joint_pos"]
+  ee_pos_local = parts["ee_pos"].reshape(n, W, E, 3)
+  root_lin_vel_local = parts["root_lin_vel"]
+  root_ang_vel_local = parts["root_ang_vel"]
+
+  box_features = window[..., BOX_FEATURE_START:BOX_FEATURE_END]
+  box_pos_local = box_features[..., 0:3]
+  box_height = box_features[..., 3:4]
+  box_rot_6d = box_features[..., 4:10]
+  box_lin_vel_local = box_features[..., 10:13]
+  box_ang_vel_local = box_features[..., 13:16]
+
+  control_dt = float(env.cfg.sim.mujoco.timestep) * float(env.cfg.decimation)
+  if W > 1:
+    joint_vel = torch.zeros_like(joint_pos)
+    joint_vel[:, :-1] = (joint_pos[:, 1:] - joint_pos[:, :-1]) / control_dt
+    joint_vel[:, -1] = joint_vel[:, -2]
+  else:
+    joint_vel = torch.zeros_like(joint_pos)
+
+  robot = env.scene["robot"]
+  default_root = robot.data.default_root_state[env_ids].clone()
+  default_pos = default_root[:, 0:3]
+  default_quat = default_root[:, 3:7]
+  yaw_T = yaw_quat(default_quat)
+  yaw_T_W = yaw_T[:, None, :].expand(n, W, 4).reshape(-1, 4)
+
+  local_xy = root_pos_local.clone()
+  local_xy[..., 2] = 0.0
+  world_offset_xy = quat_apply(yaw_T_W, local_xy.reshape(-1, 3)).reshape(n, W, 3)
+  pelvis_pos_w = world_offset_xy.clone()
+  pelvis_pos_w[..., 0] += default_pos[:, None, 0]
+  pelvis_pos_w[..., 1] += default_pos[:, None, 1]
+  pelvis_pos_w[..., 2] = root_pos_local[..., 2]
+
+  root_rot_local_quat = rot6d_to_quat(root_rot_6d.reshape(-1, 6)).reshape(n, W, 4)
+  pelvis_quat_w = quat_mul(yaw_T_W, root_rot_local_quat.reshape(-1, 4)).reshape(n, W, 4)
+
+  lin_vel_w = quat_apply(yaw_T_W, root_lin_vel_local.reshape(-1, 3)).reshape(n, W, 3)
+  ang_vel_w = quat_apply(yaw_T_W, root_ang_vel_local.reshape(-1, 3)).reshape(n, W, 3)
+
+  yaw_T_E = yaw_T[:, None, None, :].expand(n, W, E, 4).reshape(-1, 4)
+  ee_offset_w = quat_apply(yaw_T_E, ee_pos_local.reshape(-1, 3)).reshape(n, W, E, 3)
+  ee_pos_w = ee_offset_w + pelvis_pos_w[:, :, None, :]
+
+  box_offset_w = quat_apply(yaw_T_W, box_pos_local.reshape(-1, 3)).reshape(n, W, 3)
+  box_pos_w = pelvis_pos_w + box_offset_w
+  box_pos_w = box_pos_w.clone()
+  box_pos_w[..., 2] = box_height.squeeze(-1)
+  box_rot_local_quat = rot6d_to_quat(box_rot_6d.reshape(-1, 6)).reshape(n, W, 4)
+  box_quat_w = quat_mul(yaw_T_W, box_rot_local_quat.reshape(-1, 4)).reshape(n, W, 4)
+  box_lin_vel_w = quat_apply(yaw_T_W, box_lin_vel_local.reshape(-1, 3)).reshape(n, W, 3)
+  box_ang_vel_w = quat_apply(yaw_T_W, box_ang_vel_local.reshape(-1, 3)).reshape(n, W, 3)
+
+  origins = env.scene.env_origins[env_ids]
+  last_root_state = torch.cat(
+    [
+      pelvis_pos_w[:, -1] + origins,
+      pelvis_quat_w[:, -1],
+      lin_vel_w[:, -1],
+      ang_vel_w[:, -1],
+    ],
+    dim=-1,
+  )
+  robot.write_root_state_to_sim(last_root_state, env_ids=env_ids)
+  robot.write_joint_state_to_sim(joint_pos[:, -1], joint_vel[:, -1], env_ids=env_ids)
+
+  box = env.scene[box_name]
+  last_box_pose = torch.cat(
+    [
+      box_pos_w[:, -1] + origins,
+      box_quat_w[:, -1],
+    ],
+    dim=-1,
+  )
+  last_box_vel = torch.cat([box_lin_vel_w[:, -1], box_ang_vel_w[:, -1]], dim=-1)
+  box.write_root_link_pose_to_sim(last_box_pose, env_ids=env_ids)
+  box.write_root_link_velocity_to_sim(last_box_vel, env_ids=env_ids)
+
+  buf: MotionBoxFeatureBuffer = env._smp_buffer  # type: ignore[attr-defined]
+  buf.reset(
+    env_ids,
+    pelvis_pos_w,
+    pelvis_quat_w,
+    lin_vel_w,
+    ang_vel_w,
+    ee_pos_w,
+    joint_pos,
+    joint_vel,
+    box_pos_w,
+    box_quat_w,
+    box_lin_vel_w,
+    box_ang_vel_w,
+    box_height,
+  )
+
+
 @torch.no_grad()
 def _ddpm_sample(env: ManagerBasedRlEnv, n: int) -> torch.Tensor:
   """Run DDPM ancestral sampling and return ``n`` denormalized windows."""
@@ -232,6 +425,22 @@ def gsi_refresh(
 
 
 @torch.no_grad()
+def gsi_box_refresh(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None = None,
+  num_samples: int = 1024,
+  step_interval: int = 2400,
+) -> None:
+  """75-D carry-box variant of ``gsi_refresh``."""
+  gsi_refresh(
+    env,
+    env_ids=env_ids,
+    num_samples=num_samples,
+    step_interval=step_interval,
+  )
+
+
+@torch.no_grad()
 def gsi_reset(env: ManagerBasedRlEnv, env_ids: torch.Tensor | None = None) -> None:
   """Generative State Initialization: sample ``n`` windows from the GSI pool and
   prime sim + feature buffer from them.  Must run AFTER mjlab's ``reset_base``.
@@ -246,3 +455,22 @@ def gsi_reset(env: ManagerBasedRlEnv, env_ids: torch.Tensor | None = None) -> No
   idx = torch.randint(0, pool.shape[0], (n,), device=env.device)
   window = pool[idx]
   _prime_sim_and_buffer(env, env_ids, window)
+
+
+@torch.no_grad()
+def gsi_box_reset(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None = None,
+  box_name: str = "box",
+) -> None:
+  """Generative State Initialization for 75-D carry-box windows."""
+  if env_ids is None:
+    env_ids = torch.arange(env.num_envs, device=env.device)
+  n = int(env_ids.numel())
+  if n == 0:
+    return
+
+  pool: torch.Tensor = env._smp_gsi_pool  # type: ignore[attr-defined]
+  idx = torch.randint(0, pool.shape[0], (n,), device=env.device)
+  window = pool[idx]
+  _prime_sim_and_box_buffer(env, env_ids, window, box_name=box_name)
