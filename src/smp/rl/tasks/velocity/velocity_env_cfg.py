@@ -76,9 +76,19 @@ def g1_velocity_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
           mdp.joint_acc_l2,
           -2.5e-7,
           {"asset_cfg": SceneEntityCfg("robot", joint_names=".*")},
-        )
+        ),
+        (
+          mdp.body_orientation_l2,
+          -1.0,
+          {"asset_cfg": SceneEntityCfg("robot", body_names=())},
+        ),
       ),
     },
+  )
+  cfg.rewards["body_orientation_l2"] = RewardTermCfg(
+    func=mdp.body_orientation_l2,
+    weight=-1.0,
+    params={"asset_cfg": SceneEntityCfg("robot", body_names=())},
   )
 
   # --- Events --------------------------------------------------------------
