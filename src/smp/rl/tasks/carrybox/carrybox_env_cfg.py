@@ -115,33 +115,6 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
           },
         ),
         (
-          carrybox_mdp.held_box_lift,
-          1.2,
-          {
-            "robot_name": "robot",
-            "box_name": "box",
-            "lateral_offset": 0.18,
-            "vertical_offset": 0.03,
-            "pos_err_scale": 8.0,
-            "min_height": 0.45,
-            "height_gate_scale": 14.0,
-          },
-        ),
-        (
-          carrybox_mdp.carried_box_progress,
-          1.2,
-          {
-            "command_name": "carrybox",
-            "robot_name": "robot",
-            "box_name": "box",
-            "lateral_offset": 0.18,
-            "vertical_offset": 0.03,
-            "pos_err_scale": 8.0,
-            "min_height": 0.45,
-            "height_gate_scale": 14.0,
-          },
-        ),
-        (
           carrybox_mdp.carried_box_to_goal,
           1.0,
           {
@@ -156,74 +129,17 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "goal_err_scale": 1.8,
           },
         ),
-        (
-          carrybox_mdp.place_box_at_goal,
-          0.8,
-          {
-            "command_name": "carrybox",
-            "box_name": "box",
-            "place_height": 0.18,
-            "goal_err_scale": 3.0,
-            "height_err_scale": 12.0,
-            "speed_err_scale": 1.0,
-          },
-        ),
-        (
-          carrybox_mdp.box_upright,
-          0.25,
-          {"box_name": "box", "tilt_err_scale": 2.0},
-        ),
       ),
       "ws": 4,
       "box_name": "box",
     },
   )
-  cfg.rewards["box_robot_distance"] = RewardTermCfg(
-    func=carrybox_mdp.box_robot_distance_penalty,
-    weight=-0.5,
-    params={"robot_name": "robot", "box_name": "box", "max_distance": 1.6},
-  )
-  cfg.rewards["box_speed"] = RewardTermCfg(
-    func=carrybox_mdp.box_speed_penalty,
-    weight=-0.05,
-    params={"box_name": "box", "max_speed": 3.0},
-  )
-  cfg.rewards["ungrasped_box_motion"] = RewardTermCfg(
-    func=carrybox_mdp.ungrasped_box_motion_penalty,
-    weight=-1.5,
-    params={
-      "robot_name": "robot",
-      "box_name": "box",
-      "lateral_offset": 0.18,
-      "vertical_offset": 0.03,
-      "pos_err_scale": 8.0,
-      "speed_threshold": 0.05,
-    },
-  )
-  cfg.rewards["feet_to_box"] = RewardTermCfg(
-    func=carrybox_mdp.feet_to_box_penalty,
-    weight=-1.0,
-    params={
-      "robot_name": "robot",
-      "box_name": "box",
-      "lateral_offset": 0.18,
-      "vertical_offset": 0.03,
-      "hand_pos_err_scale": 8.0,
-      "margin": 0.28,
-      "speed_threshold": 0.05,
-    },
-  )
-  cfg.rewards["action_rate_l2"] = RewardTermCfg(func=mdp.action_rate_l2, weight=-0.01)
-  cfg.rewards["joint_pos_limits"] = RewardTermCfg(
-    func=mdp.joint_pos_limits,
-    weight=-5.0,
-    params={"asset_cfg": SceneEntityCfg("robot", joint_names=(".*",))},
-  )
+
 
   # --- Events --------------------------------------------------------------
   cfg.events["init_smp_state"].func = init_smp_box_state
   cfg.events["init_smp_state"].params["ckpt_path"] = (
-    "logs/pretrain/pretrain/20260608_151625/pretrained.pt"
+    "datasets/pretrain_ckpt/pretrained_carrybox.pt"
   )
   cfg.events["init_smp_state"].params["box_name"] = "box"
   cfg.events["gsi_reset"].func = gsi_box_reset
