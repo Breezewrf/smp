@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 from mjlab.entity import Entity
 from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
-from mjlab.utils.lab_api.math import quat_from_euler_xyz
 
 if TYPE_CHECKING:
   import viser
@@ -91,12 +90,7 @@ class CarryBoxCommand(CommandTerm):
     origins = self._env.scene.env_origins[env_ids]
     self.episode_success[env_ids] = 0.0
 
-    sr = self.cfg.start_pose_range
-    start_local = torch.empty(n, 3, device=self.device)
-    start_local[:, 0].uniform_(sr.x[0], sr.x[1])
-    start_local[:, 1].uniform_(sr.y[0], sr.y[1])
-    start_local[:, 2].uniform_(sr.z[0], sr.z[1])
-    start_pos = start_local + origins
+    start_pos = self.box.data.root_link_pos_w[env_ids].clone()
 
     if self.cfg.goal_mode == "relative":
       gr = self.cfg.relative_goal_range
@@ -124,20 +118,6 @@ class CarryBoxCommand(CommandTerm):
     lift_memory = getattr(self._env, "_carrybox_has_held_lift", None)
     if isinstance(lift_memory, torch.Tensor) and lift_memory.shape == (self.num_envs,):
       lift_memory[env_ids] = False
-
-    yaw = torch.empty(n, device=self.device).uniform_(sr.yaw[0], sr.yaw[1])
-    quat = quat_from_euler_xyz(
-      torch.zeros(n, device=self.device),
-      torch.zeros(n, device=self.device),
-      yaw,
-    )
-    pose = torch.cat([start_pos, quat], dim=-1)
-    velocity = torch.zeros(n, 6, device=self.device)
-    self.box.write_root_link_pose_to_sim(pose, env_ids=env_ids)
-    self.box.write_root_link_velocity_to_sim(velocity, env_ids=env_ids)
-    from smp.rl.rewards import reset_box_buffer_to_pose
-
-    reset_box_buffer_to_pose(self._env, env_ids, start_pos, quat)
 
   def _progress_fraction(self, box_pos_w: torch.Tensor) -> torch.Tensor:
     start_xy = self.start_pos_w[:, :2]
@@ -243,13 +223,6 @@ class CarryBoxCommandCfg(CommandTermCfg):
   goal_height: float = 0.18
 
   @dataclass
-  class StartPoseRangeCfg:
-    x: tuple[float, float] = (0.45, 0.65)
-    y: tuple[float, float] = (-0.15, 0.15)
-    z: tuple[float, float] = (0.18, 0.18)
-    yaw: tuple[float, float] = (-math.pi, math.pi)
-
-  @dataclass
   class RelativeGoalRangeCfg:
     distance: tuple[float, float] = (1.2, 2.4)
     angle: tuple[float, float] | None = (-0.6, 0.6)
@@ -268,7 +241,6 @@ class CarryBoxCommandCfg(CommandTermCfg):
     start_color: tuple[float, float, float, float] = (1.0, 0.5, 0.0, 0.35)
     arrow_color: tuple[float, float, float, float] = (0.2, 0.8, 1.0, 0.5)
 
-  start_pose_range: StartPoseRangeCfg = field(default_factory=StartPoseRangeCfg)
   relative_goal_range: RelativeGoalRangeCfg = field(default_factory=RelativeGoalRangeCfg)
   target_pose_range: TargetPoseRangeCfg = field(default_factory=TargetPoseRangeCfg)
   viz: VizCfg = field(default_factory=VizCfg)
