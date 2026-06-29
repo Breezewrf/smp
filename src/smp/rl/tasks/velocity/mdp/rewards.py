@@ -88,14 +88,23 @@ def body_orientation_l2(
   """
   asset: Entity = env.scene[asset_cfg.name]
 
-  # If body_ids are specified, compute projected gravity for that body.
-  if asset_cfg.body_ids:
-    body_quat_w = asset.data.body_link_quat_w[:, asset_cfg.body_ids, :]  # [B, N, 4]
-    body_quat_w = body_quat_w.squeeze(1)  # [B, 4]
-    gravity_w = asset.data.gravity_vec_w  # [3]
-    projected_gravity_b = quat_apply_inverse(body_quat_w, gravity_w)  # [B, 3]
-    xy_squared = torch.sum(torch.square(projected_gravity_b[:, :2]), dim=1)
-  else:
+  if asset_cfg.body_names == ():
     # Use root link projected gravity.
-    xy_squared = torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
-  return xy_squared
+    return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+
+  body_quat_w = asset.data.body_link_quat_w[:, asset_cfg.body_ids, :]
+  if body_quat_w.ndim == 2:
+    body_quat_w = body_quat_w[:, None, :]
+
+  gravity_w = asset.data.gravity_vec_w
+  if gravity_w.ndim == 1:
+    gravity_w = gravity_w[None, None, :].expand(body_quat_w.shape[0], body_quat_w.shape[1], 3)
+  elif gravity_w.ndim == 2:
+    gravity_w = gravity_w[:, None, :].expand(-1, body_quat_w.shape[1], -1)
+
+  flat_quat = body_quat_w.reshape(-1, 4)
+  flat_gravity = gravity_w.reshape(-1, 3)
+  projected_gravity_b = quat_apply_inverse(flat_quat, flat_gravity).reshape(
+    body_quat_w.shape[0], body_quat_w.shape[1], 3
+  )
+  return torch.sum(torch.square(projected_gravity_b[..., :2]), dim=-1).mean(dim=1)
