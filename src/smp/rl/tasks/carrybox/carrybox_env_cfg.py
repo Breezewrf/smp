@@ -95,7 +95,7 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "task_terms": (
         (
           carrybox_mdp.robot_to_box,
-          0.15,
+          0.10,
           {
             "command_name": "carrybox",
             "robot_name": "robot",
@@ -105,7 +105,7 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         ),
         (
           carrybox_mdp.hands_to_box,
-          0.8,
+          0.35,
           {
             "robot_name": "robot",
             "box_name": "box",
@@ -115,8 +115,35 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
           },
         ),
         (
+          carrybox_mdp.held_box_lift,
+          0.40,
+          {
+            "robot_name": "robot",
+            "box_name": "box",
+            "lateral_offset": 0.18,
+            "vertical_offset": 0.03,
+            "pos_err_scale": 8.0,
+            "min_height": 0.45,
+            "height_gate_scale": 14.0,
+          },
+        ),
+        (
+          carrybox_mdp.carried_box_progress,
+          0.80,
+          {
+            "command_name": "carrybox",
+            "robot_name": "robot",
+            "box_name": "box",
+            "lateral_offset": 0.18,
+            "vertical_offset": 0.03,
+            "pos_err_scale": 8.0,
+            "min_height": 0.45,
+            "height_gate_scale": 14.0,
+          },
+        ),
+        (
           carrybox_mdp.carried_box_to_goal,
-          1.0,
+          0.60,
           {
             "command_name": "carrybox",
             "robot_name": "robot",
@@ -129,6 +156,18 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "goal_err_scale": 1.8,
           },
         ),
+        (
+          carrybox_mdp.place_box_at_goal,
+          1.00,
+          {
+            "command_name": "carrybox",
+            "box_name": "box",
+            "place_height": 0.18,
+            "goal_err_scale": 3.0,
+            "height_err_scale": 12.0,
+            "speed_err_scale": 1.0,
+          },
+        ),
       ),
       "ws": 4,
       "box_name": "box",
@@ -139,7 +178,7 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # --- Events --------------------------------------------------------------
   cfg.events["init_smp_state"].func = init_smp_box_state
   cfg.events["init_smp_state"].params["ckpt_path"] = (
-    "datasets/pretrain_ckpt/pretrained_carrybox.pt"
+    "datasets/pretrain_ckpt/pretrained_carrybox_wowalk.pt"
   )
   cfg.events["init_smp_state"].params["box_name"] = "box"
   cfg.events["gsi_reset"].func = gsi_box_reset
