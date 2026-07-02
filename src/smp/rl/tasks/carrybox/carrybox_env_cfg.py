@@ -200,7 +200,13 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.observations["actor"].enable_corruption = False
     cfg.observations["critic"].enable_corruption = False
     cfg.commands["carrybox"].resampling_time_range = (20.0, 20.0)
-
+    cfg.commands["carrybox"].fixed_start_pos = (0.30, 0.0, 0.88)
+    cfg.commands["carrybox"].fixed_goal_offset = (6.60, 0.0, 0.88)
+    cfg.rewards = {}
+    # cfg.terminations = {}
+    cfg.events.pop("init_smp_state", None)
+    cfg.events.pop("gsi_reset", None)
+    cfg.events.pop("gsi_refresh", None)
   return cfg
 
 

@@ -90,9 +90,30 @@ class CarryBoxCommand(CommandTerm):
     origins = self._env.scene.env_origins[env_ids]
     self.episode_success[env_ids] = 0.0
 
-    start_pos = self.box.data.root_link_pos_w[env_ids].clone()
+    if self.cfg.fixed_start_pos is not None:
+      start_pos = torch.tensor(
+        self.cfg.fixed_start_pos,
+        dtype=torch.float32,
+        device=self.device,
+      ).expand(n, -1) + origins
+      quat = torch.zeros(n, 4, device=self.device)
+      quat[:, 0] = 1.0
+      pose = torch.cat([start_pos, quat], dim=-1)
+      velocity = torch.zeros(n, 6, device=self.device)
+      self.box.write_root_link_pose_to_sim(pose, env_ids=env_ids)
+      self.box.write_root_link_velocity_to_sim(velocity, env_ids=env_ids)
+    else:
+      start_pos = self.box.data.root_link_pos_w[env_ids].clone()
 
-    if self.cfg.goal_mode == "relative":
+    if self.cfg.fixed_goal_offset is not None:
+      goal_offset = torch.tensor(
+        self.cfg.fixed_goal_offset,
+        dtype=torch.float32,
+        device=self.device,
+      ).expand(n, -1)
+      target_pos = start_pos + goal_offset
+      target_pos[:, 2] = origins[:, 2] + self.cfg.goal_height
+    elif self.cfg.goal_mode == "relative":
       gr = self.cfg.relative_goal_range
       dist = torch.empty(n, device=self.device).uniform_(gr.distance[0], gr.distance[1])
       if gr.angle is None:
@@ -221,6 +242,8 @@ class CarryBoxCommandCfg(CommandTermCfg):
   place_speed_threshold: float = 0.35
   goal_mode: Literal["relative", "absolute"] = "relative"
   goal_height: float = 0.18
+  fixed_start_pos: tuple[float, float, float] | None = None
+  fixed_goal_offset: tuple[float, float, float] | None = None
 
   @dataclass
   class RelativeGoalRangeCfg:
