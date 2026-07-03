@@ -12,6 +12,7 @@ import torch
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.utils.lab_api.math import quat_apply, quat_mul, yaw_quat
 
+from smp.rl.carrybox_stages import CARRYBOX_STAGE_IDS, CARRYBOX_STAGE_NAMES
 from smp.rl.utils import (
   BOX_FEATURE_END,
   BOX_FEATURE_START,
@@ -440,6 +441,108 @@ def gsi_box_refresh(
   )
 
 
+def _sample_gsi_box_stage_ids(
+  env: ManagerBasedRlEnv,
+  n: int,
+  stage_weights: tuple[float, float, float] | None,
+) -> torch.Tensor:
+  """Sample pickup/carry/place stage ids for carry-box GSI reset."""
+  if stage_weights is None:
+    return torch.randint(0, len(CARRYBOX_STAGE_NAMES), (n,), device=env.device)
+
+  weights = torch.tensor(stage_weights, dtype=torch.float32, device=env.device)
+  if weights.numel() != len(CARRYBOX_STAGE_NAMES):
+    msg = (
+      f"stage_weights must have {len(CARRYBOX_STAGE_NAMES)} values "
+      f"(pickup, carry, place), got {tuple(stage_weights)}."
+    )
+    raise ValueError(msg)
+  if torch.any(weights < 0.0) or weights.sum() <= 0.0:
+    msg = f"stage_weights must be non-negative with positive sum, got {stage_weights}."
+    raise ValueError(msg)
+  return torch.multinomial(weights / weights.sum(), n, replacement=True)
+
+
+def _gsi_box_stage_mask(
+  pool: torch.Tensor,
+  stage_id: int,
+  *,
+  pickup_height_max: float,
+  pickup_dist_max: float,
+  carry_height_min: float,
+  carry_dist_max: float,
+  place_height_min: float,
+  place_dist_max: float,
+  place_speed_max: float,
+) -> torch.Tensor:
+  """Return pool entries matching a coarse carry-box skill stage."""
+  box_features = pool[:, -1, BOX_FEATURE_START:BOX_FEATURE_END]
+  box_offset = box_features[:, 0:3]
+  box_height = box_features[:, 3]
+  box_lin_vel = box_features[:, 10:13]
+  box_dist = torch.norm(box_offset[:, :2], dim=-1)
+  box_speed = torch.norm(box_lin_vel, dim=-1)
+
+  if stage_id == CARRYBOX_STAGE_IDS["pickup"]:
+    return (box_height <= pickup_height_max) & (box_dist <= pickup_dist_max)
+  if stage_id == CARRYBOX_STAGE_IDS["carry"]:
+    return (box_height >= carry_height_min) & (box_dist <= carry_dist_max)
+  if stage_id == CARRYBOX_STAGE_IDS["place"]:
+    return (
+      (box_height >= place_height_min)
+      & (box_dist <= place_dist_max)
+      & (box_speed <= place_speed_max)
+    )
+  msg = f"Unknown carry-box stage id: {stage_id}."
+  raise ValueError(msg)
+
+
+def _sample_staged_gsi_box_indices(
+  env: ManagerBasedRlEnv,
+  pool: torch.Tensor,
+  stage_ids: torch.Tensor,
+  *,
+  pickup_height_max: float,
+  pickup_dist_max: float,
+  carry_height_min: float,
+  carry_dist_max: float,
+  place_height_min: float,
+  place_dist_max: float,
+  place_speed_max: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Sample one GSI pool index per env from the requested stage buckets."""
+  idx = torch.empty(stage_ids.shape[0], dtype=torch.long, device=env.device)
+  fallback = torch.zeros(stage_ids.shape[0], dtype=torch.bool, device=env.device)
+
+  for stage_id in range(len(CARRYBOX_STAGE_NAMES)):
+    env_mask = stage_ids == stage_id
+    num_envs = int(env_mask.sum().item())
+    if num_envs == 0:
+      continue
+
+    valid_mask = _gsi_box_stage_mask(
+      pool,
+      stage_id,
+      pickup_height_max=pickup_height_max,
+      pickup_dist_max=pickup_dist_max,
+      carry_height_min=carry_height_min,
+      carry_dist_max=carry_dist_max,
+      place_height_min=place_height_min,
+      place_dist_max=place_dist_max,
+      place_speed_max=place_speed_max,
+    )
+    valid_idx = valid_mask.nonzero(as_tuple=False).flatten()
+    if valid_idx.numel() == 0:
+      idx[env_mask] = torch.randint(0, pool.shape[0], (num_envs,), device=env.device)
+      fallback[env_mask] = True
+      continue
+
+    sample = torch.randint(0, valid_idx.numel(), (num_envs,), device=env.device)
+    idx[env_mask] = valid_idx[sample]
+
+  return idx, fallback
+
+
 @torch.no_grad()
 def gsi_reset(env: ManagerBasedRlEnv, env_ids: torch.Tensor | None = None) -> None:
   """Generative State Initialization: sample ``n`` windows from the GSI pool and
@@ -462,6 +565,14 @@ def gsi_box_reset(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor | None = None,
   box_name: str = "box",
+  stage_weights: tuple[float, float, float] | None = None,
+  pickup_height_max: float = 0.30,
+  pickup_dist_max: float = 0.85,
+  carry_height_min: float = 0.45,
+  carry_dist_max: float = 0.85,
+  place_height_min: float = 0.45,
+  place_dist_max: float = 0.85,
+  place_speed_max: float = 1.25,
 ) -> None:
   """Generative State Initialization for 75-D carry-box windows."""
   if env_ids is None:
@@ -471,6 +582,38 @@ def gsi_box_reset(
     return
 
   pool: torch.Tensor = env._smp_gsi_pool  # type: ignore[attr-defined]
-  idx = torch.randint(0, pool.shape[0], (n,), device=env.device)
+  stage_ids = _sample_gsi_box_stage_ids(env, n, stage_weights)
+  idx, fallback = _sample_staged_gsi_box_indices(
+    env,
+    pool,
+    stage_ids,
+    pickup_height_max=pickup_height_max,
+    pickup_dist_max=pickup_dist_max,
+    carry_height_min=carry_height_min,
+    carry_dist_max=carry_dist_max,
+    place_height_min=place_height_min,
+    place_dist_max=place_dist_max,
+    place_speed_max=place_speed_max,
+  )
   window = pool[idx]
   _prime_sim_and_box_buffer(env, env_ids, window, box_name=box_name)
+
+  reset_stage = getattr(env, "_carrybox_reset_stage", None)
+  if (
+    not isinstance(reset_stage, torch.Tensor)
+    or reset_stage.shape != (env.num_envs,)
+    or reset_stage.device != torch.device(env.device)
+  ):
+    reset_stage = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    env._carrybox_reset_stage = reset_stage  # type: ignore[attr-defined]
+  reset_stage[env_ids] = stage_ids
+
+  fallback_metric = getattr(env, "_carrybox_gsi_stage_fallback", None)
+  if (
+    not isinstance(fallback_metric, torch.Tensor)
+    or fallback_metric.shape != (env.num_envs,)
+    or fallback_metric.device != torch.device(env.device)
+  ):
+    fallback_metric = torch.zeros(env.num_envs, device=env.device)
+    env._carrybox_gsi_stage_fallback = fallback_metric  # type: ignore[attr-defined]
+  fallback_metric[env_ids] = fallback.float()

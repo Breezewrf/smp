@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING
 import torch
 from mjlab.utils.lab_api.math import quat_apply
 
+from smp.rl.carrybox_stages import CARRYBOX_STAGE_IDS
+from smp.rl.rewards import smp_box_guidance_reward
+
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
 
@@ -90,6 +93,10 @@ def _held_lift_memory(
   if held_score is not None:
     memory |= held_score > score_threshold
   return memory.float()
+
+
+def _set_metric(env: "ManagerBasedRlEnv", name: str, value: torch.Tensor) -> None:
+  setattr(env, f"_carrybox_{name}", value.detach())
 
 
 def box_to_goal(
@@ -183,6 +190,123 @@ def held_box_lift(
   held_score = hand_score * lift_score
   _held_lift_memory(env, held_score=held_score, score_threshold=memory_threshold)
   return held_score
+
+
+def stage_gated_carrybox_task(
+  env: "ManagerBasedRlEnv",
+  command_name: str,
+  robot_name: str = "robot",
+  box_name: str = "box",
+  left_hand_body: str = "left_wrist_yaw_link",
+  right_hand_body: str = "right_wrist_yaw_link",
+  lateral_offset: float = 0.18,
+  vertical_offset: float = 0.03,
+  hand_pos_err_scale: float = 8.0,
+  min_lift_height: float = 0.45,
+  lift_height_gate_scale: float = 14.0,
+  lift_memory_threshold: float = 0.45,
+  near_goal_threshold: float = 0.28,
+  near_goal_gate_scale: float = 10.0,
+  place_height: float = 0.18,
+  goal_err_scale: float = 3.0,
+  place_height_err_scale: float = 12.0,
+  place_speed_err_scale: float = 1.0,
+  pickup_robot_weight: float = 0.15,
+  pickup_hand_weight: float = 0.45,
+  pickup_lift_weight: float = 0.80,
+  carry_progress_weight: float = 0.90,
+  carry_goal_weight: float = 0.45,
+  place_goal_weight: float = 0.60,
+  place_down_weight: float = 1.25,
+  reset_stage_gate_weight: float = 0.35,
+  smp_fixed_timesteps: tuple[int, ...] = (8, 15, 22),
+  smp_ws: float = 4.0,
+) -> torch.Tensor:
+  """Phase-gated carry-box objective multiplied by 75-D SMP guidance.
+
+  The reset stage only biases the initial phase. Runtime gates still advance
+  pickup -> carry -> place from the current box state.
+  """
+  cmd = _command(env, command_name)
+  box = env.scene[box_name]
+  robot = env.scene[robot_name]
+
+  box_pos = box.data.root_link_pos_w
+  robot_box_err = torch.norm(box_pos[:, :2] - robot.data.root_link_pos_w[:, :2], dim=-1)
+  robot_score = torch.exp(-2.0 * robot_box_err)
+  hand_score = _hands_to_box_score(
+    env,
+    robot_name,
+    box_name,
+    left_hand_body,
+    right_hand_body,
+    lateral_offset,
+    vertical_offset,
+    hand_pos_err_scale,
+  )
+  height = _box_height_above_origin(env, box_name)
+  lift_score = torch.sigmoid((height - min_lift_height) * lift_height_gate_scale)
+  held_score = hand_score * lift_score
+  has_lifted = _held_lift_memory(
+    env,
+    held_score=held_score,
+    score_threshold=lift_memory_threshold,
+  )
+
+  progress = cmd._progress_fraction(box_pos)  # noqa: SLF001
+  goal_err = torch.norm(cmd.target_pos_w[:, :2] - box_pos[:, :2], dim=-1)
+  goal_score = torch.exp(-goal_err_scale * goal_err)
+  near_goal = torch.sigmoid((near_goal_threshold - goal_err) * near_goal_gate_scale)
+  height_down_score = torch.exp(
+    -place_height_err_scale * torch.abs(height - place_height)
+  )
+  settle_score = torch.exp(
+    -place_speed_err_scale * torch.norm(box.data.root_link_lin_vel_w, dim=-1)
+  )
+  place_score = goal_score * height_down_score * settle_score
+
+  reset_stage = getattr(cmd, "reset_stage", None)
+  if not isinstance(reset_stage, torch.Tensor) or reset_stage.shape != (env.num_envs,):
+    reset_stage = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+  pickup_reset = (reset_stage == CARRYBOX_STAGE_IDS["pickup"]).float()
+  carry_reset = (reset_stage == CARRYBOX_STAGE_IDS["carry"]).float()
+  place_reset = (reset_stage == CARRYBOX_STAGE_IDS["place"]).float()
+
+  pickup_gate = (1.0 - has_lifted) * (1.0 + reset_stage_gate_weight * pickup_reset)
+  carry_gate = has_lifted * (1.0 - near_goal) * (
+    1.0 + reset_stage_gate_weight * carry_reset
+  )
+  place_gate = has_lifted * near_goal * (1.0 + reset_stage_gate_weight * place_reset)
+
+  pickup_task = (
+    pickup_robot_weight * robot_score
+    + pickup_hand_weight * hand_score
+    + pickup_lift_weight * held_score
+  )
+  carry_task = (
+    carry_progress_weight * progress * held_score
+    + carry_goal_weight * goal_score * held_score
+  )
+  place_task = (
+    place_goal_weight * goal_score * has_lifted
+    + place_down_weight * place_score * has_lifted
+  )
+  task = pickup_gate * pickup_task + carry_gate * carry_task + place_gate * place_task
+
+  _set_metric(env, "pickup_gate", pickup_gate.clamp(0.0, 1.0))
+  _set_metric(env, "carry_gate", carry_gate.clamp(0.0, 1.0))
+  _set_metric(env, "place_gate", place_gate.clamp(0.0, 1.0))
+  _set_metric(env, "pickup_task", pickup_task)
+  _set_metric(env, "carry_task", carry_task)
+  _set_metric(env, "place_task", place_task)
+  _set_metric(env, "stage_task", task)
+
+  return task * smp_box_guidance_reward(
+    env,
+    fixed_timesteps=smp_fixed_timesteps,
+    ws=smp_ws,
+    box_name=box_name,
+  )
 
 
 def carried_box_progress(

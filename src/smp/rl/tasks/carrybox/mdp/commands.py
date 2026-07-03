@@ -11,6 +11,8 @@ import torch
 from mjlab.entity import Entity
 from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
 
+from smp.rl.carrybox_stages import CARRYBOX_STAGE_IDS, CARRYBOX_STAGE_NAMES
+
 if TYPE_CHECKING:
   import viser
   from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
@@ -38,11 +40,25 @@ class CarryBoxCommand(CommandTerm):
     self.target_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
     # [box_rel_robot_b(3), goal_rel_box_b(3), progress, goal_dist]
     self.command_b = torch.zeros(self.num_envs, 8, device=self.device)
+    self.reset_stage = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
     self.episode_success = torch.zeros(self.num_envs, device=self.device)
 
     self.metrics["box_goal_error"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["robot_box_error"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["box_progress"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["box_height"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["has_lifted"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["stage_pickup"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["stage_carry"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["stage_place"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["gsi_stage_fallback"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["pickup_gate"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["carry_gate"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["place_gate"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["pickup_task"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["carry_task"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["place_task"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["stage_task"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["at_goal"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["placed_at_goal"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["episode_success"] = torch.zeros(self.num_envs, device=self.device)
@@ -71,6 +87,13 @@ class CarryBoxCommand(CommandTerm):
       if isinstance(lift_memory, torch.Tensor) and lift_memory.shape == (self.num_envs,)
       else torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
     )
+    gsi_fallback = getattr(self._env, "_carrybox_gsi_stage_fallback", None)
+    if (
+      not isinstance(gsi_fallback, torch.Tensor)
+      or gsi_fallback.shape != (self.num_envs,)
+      or gsi_fallback.device != torch.device(self.device)
+    ):
+      gsi_fallback = torch.zeros(self.num_envs, device=self.device)
     placed = (goal_err < self.cfg.success_threshold) & height_ok & speed_ok & has_lifted
     placed_at_goal = placed.float()
     self.episode_success = torch.maximum(self.episode_success, placed_at_goal)
@@ -78,6 +101,29 @@ class CarryBoxCommand(CommandTerm):
     self.metrics["box_goal_error"] = goal_err
     self.metrics["robot_box_error"] = robot_err
     self.metrics["box_progress"] = progress
+    self.metrics["box_height"] = height
+    self.metrics["has_lifted"] = has_lifted.float()
+    self.metrics["stage_pickup"] = (self.reset_stage == CARRYBOX_STAGE_IDS["pickup"]).float()
+    self.metrics["stage_carry"] = (self.reset_stage == CARRYBOX_STAGE_IDS["carry"]).float()
+    self.metrics["stage_place"] = (self.reset_stage == CARRYBOX_STAGE_IDS["place"]).float()
+    self.metrics["gsi_stage_fallback"] = gsi_fallback.clone()
+    for metric_name in (
+      "pickup_gate",
+      "carry_gate",
+      "place_gate",
+      "pickup_task",
+      "carry_task",
+      "place_task",
+      "stage_task",
+    ):
+      metric = getattr(self._env, f"_carrybox_{metric_name}", None)
+      if (
+        not isinstance(metric, torch.Tensor)
+        or metric.shape != (self.num_envs,)
+        or metric.device != torch.device(self.device)
+      ):
+        metric = torch.zeros(self.num_envs, device=self.device)
+      self.metrics[metric_name] = metric.clone()
     self.metrics["at_goal"] = at_goal
     self.metrics["placed_at_goal"] = placed_at_goal
     self.metrics["episode_success"] = self.episode_success
@@ -89,6 +135,7 @@ class CarryBoxCommand(CommandTerm):
     n = int(env_ids.numel())
     origins = self._env.scene.env_origins[env_ids]
     self.episode_success[env_ids] = 0.0
+    self.reset_stage[env_ids] = self._sample_reset_stage(env_ids)
 
     if self.cfg.fixed_start_pos is not None:
       start_pos = torch.tensor(
@@ -114,12 +161,13 @@ class CarryBoxCommand(CommandTerm):
       target_pos = start_pos + goal_offset
       target_pos[:, 2] = origins[:, 2] + self.cfg.goal_height
     elif self.cfg.goal_mode == "relative":
-      gr = self.cfg.relative_goal_range
-      dist = torch.empty(n, device=self.device).uniform_(gr.distance[0], gr.distance[1])
-      if gr.angle is None:
-        angle = torch.zeros(n, device=self.device)
-      else:
-        angle = torch.empty(n, device=self.device).uniform_(gr.angle[0], gr.angle[1])
+      dist_min, dist_max = self._stage_goal_distance_range(env_ids)
+      dist = dist_min + torch.rand(n, device=self.device) * (dist_max - dist_min)
+      angle_min, angle_max = self._stage_goal_angle_range(env_ids)
+      angle = angle_min + torch.rand(n, device=self.device) * (angle_max - angle_min)
+      no_angle_randomization = angle_max <= angle_min
+      if torch.any(no_angle_randomization):
+        angle[no_angle_randomization] = angle_min[no_angle_randomization]
       goal_local = torch.zeros(n, 3, device=self.device)
       goal_local[:, 0] = dist * torch.cos(angle)
       goal_local[:, 1] = dist * torch.sin(angle)
@@ -137,8 +185,78 @@ class CarryBoxCommand(CommandTerm):
     self.start_pos_w[env_ids] = start_pos
     self.target_pos_w[env_ids] = target_pos
     lift_memory = getattr(self._env, "_carrybox_has_held_lift", None)
-    if isinstance(lift_memory, torch.Tensor) and lift_memory.shape == (self.num_envs,):
-      lift_memory[env_ids] = False
+    if (
+      not isinstance(lift_memory, torch.Tensor)
+      or lift_memory.shape != (self.num_envs,)
+      or lift_memory.device != torch.device(self.device)
+    ):
+      lift_memory = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+      self._env._carrybox_has_held_lift = lift_memory  # type: ignore[attr-defined]
+    lift_memory[env_ids] = self.reset_stage[env_ids] != CARRYBOX_STAGE_IDS["pickup"]
+
+  def _sample_reset_stage(self, env_ids: torch.Tensor) -> torch.Tensor:
+    stage = getattr(self._env, "_carrybox_reset_stage", None)
+    if (
+      isinstance(stage, torch.Tensor)
+      and stage.shape == (self.num_envs,)
+      and stage.device == torch.device(self.device)
+    ):
+      return stage[env_ids].long().clamp(0, len(CARRYBOX_STAGE_NAMES) - 1)
+
+    weights = torch.tensor(
+      self.cfg.reset_stage_weights,
+      dtype=torch.float32,
+      device=self.device,
+    )
+    if torch.any(weights < 0.0) or weights.sum() <= 0.0:
+      msg = (
+        "reset_stage_weights must be non-negative with positive sum, "
+        f"got {self.cfg.reset_stage_weights}."
+      )
+      raise ValueError(msg)
+    return torch.multinomial(weights / weights.sum(), env_ids.numel(), replacement=True)
+
+  def _stage_goal_distance_range(
+    self,
+    env_ids: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    n = int(env_ids.numel())
+    stage = self.reset_stage[env_ids]
+    min_dist = torch.empty(n, device=self.device)
+    max_dist = torch.empty(n, device=self.device)
+    ranges = (
+      self.cfg.pickup_goal_distance,
+      self.cfg.carry_goal_distance,
+      self.cfg.place_goal_distance,
+    )
+    for stage_id, distance_range in enumerate(ranges):
+      mask = stage == stage_id
+      min_dist[mask] = distance_range[0]
+      max_dist[mask] = distance_range[1]
+    return min_dist, max_dist
+
+  def _stage_goal_angle_range(
+    self,
+    env_ids: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    n = int(env_ids.numel())
+    stage = self.reset_stage[env_ids]
+    min_angle = torch.empty(n, device=self.device)
+    max_angle = torch.empty(n, device=self.device)
+    ranges = (
+      self.cfg.pickup_goal_angle,
+      self.cfg.carry_goal_angle,
+      self.cfg.place_goal_angle,
+    )
+    default_angle = self.cfg.relative_goal_range.angle
+    if default_angle is None:
+      default_angle = (0.0, 0.0)
+    for stage_id, angle_range in enumerate(ranges):
+      selected = default_angle if angle_range is None else angle_range
+      mask = stage == stage_id
+      min_angle[mask] = selected[0]
+      max_angle[mask] = selected[1]
+    return min_angle, max_angle
 
   def _progress_fraction(self, box_pos_w: torch.Tensor) -> torch.Tensor:
     start_xy = self.start_pos_w[:, :2]
@@ -244,6 +362,13 @@ class CarryBoxCommandCfg(CommandTermCfg):
   goal_height: float = 0.18
   fixed_start_pos: tuple[float, float, float] | None = None
   fixed_goal_offset: tuple[float, float, float] | None = None
+  reset_stage_weights: tuple[float, float, float] = (0.45, 0.35, 0.20)
+  pickup_goal_distance: tuple[float, float] = (0.35, 0.70)
+  carry_goal_distance: tuple[float, float] = (0.60, 1.20)
+  place_goal_distance: tuple[float, float] = (0.00, 0.20)
+  pickup_goal_angle: tuple[float, float] | None = None
+  carry_goal_angle: tuple[float, float] | None = None
+  place_goal_angle: tuple[float, float] | None = (-0.20, 0.20)
 
   @dataclass
   class RelativeGoalRangeCfg:

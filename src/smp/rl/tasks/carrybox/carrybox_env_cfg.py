@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import mujoco
 from mjlab.entity import EntityCfg
-from mjlab.envs import ManagerBasedRlEnvCfg, mdp
+from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -12,7 +12,6 @@ from mjlab.managers.termination_manager import TerminationTermCfg
 
 from smp.rl.env_cfg import g1_smp_env_cfg
 from smp.rl.events import gsi_box_refresh, gsi_box_reset, init_smp_box_state
-from smp.rl.rewards import task_smp_box_product
 from smp.rl.tasks.carrybox import mdp as carrybox_mdp
 
 
@@ -68,6 +67,10 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     resampling_time_range=(20.0, 20.0),
     debug_vis=True,
     success_threshold=0.25,
+    reset_stage_weights=(0.45, 0.35, 0.20),
+    pickup_goal_distance=(0.35, 0.70),
+    carry_goal_distance=(0.60, 1.20),
+    place_goal_distance=(0.00, 0.20),
   )
   # Start with a shorter target range. The old 1.2-2.4m range let PPO discover
   # foot pushes before it learned the harder grasp/lift/carry sequence.
@@ -88,89 +91,14 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.observations["critic"].terms["box_velocity"] = box_vel_obs
 
   # --- Rewards -------------------------------------------------------------
-  cfg.rewards["task_smp_product"] = RewardTermCfg(
-    func=task_smp_box_product,
+  cfg.rewards["task_smp_stage_gated"] = RewardTermCfg(
+    func=carrybox_mdp.stage_gated_carrybox_task,
     weight=1.0,
     params={
-      "task_terms": (
-        (
-          carrybox_mdp.robot_to_box,
-          0.10,
-          {
-            "command_name": "carrybox",
-            "robot_name": "robot",
-            "box_name": "box",
-            "pos_err_scale": 2.0,
-          },
-        ),
-        (
-          carrybox_mdp.hands_to_box,
-          0.35,
-          {
-            "robot_name": "robot",
-            "box_name": "box",
-            "lateral_offset": 0.18,
-            "vertical_offset": 0.03,
-            "pos_err_scale": 8.0,
-          },
-        ),
-        (
-          carrybox_mdp.held_box_lift,
-          0.40,
-          {
-            "robot_name": "robot",
-            "box_name": "box",
-            "lateral_offset": 0.18,
-            "vertical_offset": 0.03,
-            "pos_err_scale": 8.0,
-            "min_height": 0.45,
-            "height_gate_scale": 14.0,
-          },
-        ),
-        (
-          carrybox_mdp.carried_box_progress,
-          0.80,
-          {
-            "command_name": "carrybox",
-            "robot_name": "robot",
-            "box_name": "box",
-            "lateral_offset": 0.18,
-            "vertical_offset": 0.03,
-            "pos_err_scale": 8.0,
-            "min_height": 0.45,
-            "height_gate_scale": 14.0,
-          },
-        ),
-        (
-          carrybox_mdp.carried_box_to_goal,
-          0.60,
-          {
-            "command_name": "carrybox",
-            "robot_name": "robot",
-            "box_name": "box",
-            "lateral_offset": 0.18,
-            "vertical_offset": 0.03,
-            "pos_err_scale": 8.0,
-            "min_height": 0.45,
-            "height_gate_scale": 14.0,
-            "goal_err_scale": 1.8,
-          },
-        ),
-        (
-          carrybox_mdp.place_box_at_goal,
-          1.00,
-          {
-            "command_name": "carrybox",
-            "box_name": "box",
-            "place_height": 0.18,
-            "goal_err_scale": 3.0,
-            "height_err_scale": 12.0,
-            "speed_err_scale": 1.0,
-          },
-        ),
-      ),
-      "ws": 4,
+      "command_name": "carrybox",
+      "robot_name": "robot",
       "box_name": "box",
+      "smp_ws": 4.0,
     },
   )
 
@@ -182,7 +110,17 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   )
   cfg.events["init_smp_state"].params["box_name"] = "box"
   cfg.events["gsi_reset"].func = gsi_box_reset
-  cfg.events["gsi_reset"].params = {"box_name": "box"}
+  cfg.events["gsi_reset"].params = {
+    "box_name": "box",
+    "stage_weights": (0.45, 0.35, 0.20),
+    "pickup_height_max": 0.30,
+    "pickup_dist_max": 0.85,
+    "carry_height_min": 0.45,
+    "carry_dist_max": 0.85,
+    "place_height_min": 0.45,
+    "place_dist_max": 0.85,
+    "place_speed_max": 1.25,
+  }
   if "gsi_refresh" in cfg.events:
     cfg.events["gsi_refresh"].func = gsi_box_refresh
   cfg.events.pop("push_robot", None)
@@ -200,10 +138,10 @@ def g1_carrybox_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.observations["actor"].enable_corruption = False
     cfg.observations["critic"].enable_corruption = False
     cfg.commands["carrybox"].resampling_time_range = (20.0, 20.0)
-    cfg.commands["carrybox"].fixed_start_pos = (0.30, 0.0, 0.88)
-    cfg.commands["carrybox"].fixed_goal_offset = (6.60, 0.0, 0.88)
+    cfg.commands["carrybox"].fixed_start_pos = (0.60, 0.0, 0.18)
+    cfg.commands["carrybox"].fixed_goal_offset = (0.80, 0.0, 0.0)
     cfg.rewards = {}
-    # cfg.terminations = {}
+    cfg.terminations = {}
     cfg.events.pop("init_smp_state", None)
     cfg.events.pop("gsi_reset", None)
     cfg.events.pop("gsi_refresh", None)
