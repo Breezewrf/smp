@@ -1,4 +1,4 @@
-"""G1 steering task with SMP guidance.
+"""Steering task with SMP guidance.
 
 Each env gets a target xy direction + speed and a target facing direction,
 periodically resampled.  Reward = vel-track + face-align, on top of the SMP
@@ -13,14 +13,14 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 
-from smp.rl.env_cfg import g1_smp_env_cfg
+from smp.rl.env_cfg import g1_smp_env_cfg, x2_loco_ckpt_path, x2_smp_env_cfg
 from smp.rl.rewards import task_smp_product
 from smp.rl.tasks.steering import mdp
 
 
-def g1_steering_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  """Build the G1 steering env cfg with SMP guidance."""
-  cfg = g1_smp_env_cfg(play=play)
+def _steering_smp_env_cfg(
+  cfg: ManagerBasedRlEnvCfg, ckpt_path: str
+) -> ManagerBasedRlEnvCfg:
 
   # --- Commands ------------------------------------------------------------
   cfg.commands["steering"] = mdp.SteeringCommandCfg(
@@ -59,9 +59,7 @@ def g1_steering_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   )
 
   # --- Events --------------------------------------------------------------
-  cfg.events["init_smp_state"].params["ckpt_path"] = (
-    "datasets/pretrain_ckpt/pretrained_lafan_run.pt"
-  )
+  cfg.events["init_smp_state"].params["ckpt_path"] = ckpt_path
 
   # --- Terminations --------------------------------------------------------
   cfg.terminations["base_too_low"] = TerminationTermCfg(
@@ -73,3 +71,15 @@ def g1_steering_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   )
 
   return cfg
+
+
+def g1_steering_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Build the G1 steering environment."""
+  return _steering_smp_env_cfg(
+    g1_smp_env_cfg(play=play), "datasets/pretrain_ckpt/pretrained_lafan_run.pt"
+  )
+
+
+def x2_steering_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Build the X2 steering environment."""
+  return _steering_smp_env_cfg(x2_smp_env_cfg(play=play), x2_loco_ckpt_path())

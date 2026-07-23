@@ -1,4 +1,4 @@
-"""G1 forward task — fixed +x heading, variable target speed.
+"""Forward task: fixed +x heading and variable target speed.
 
 A specialization of the steering task with the world-frame target and face
 directions pinned to ``+x``.
@@ -12,14 +12,14 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 
-from smp.rl.env_cfg import g1_smp_env_cfg
+from smp.rl.env_cfg import g1_smp_env_cfg, x2_loco_ckpt_path, x2_smp_env_cfg
 from smp.rl.rewards import task_smp_product
 from smp.rl.tasks.steering import mdp
 
 
-def g1_forward_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  """Build the G1 forward env cfg with SMP guidance."""
-  cfg = g1_smp_env_cfg(play=play)
+def _forward_smp_env_cfg(
+  cfg: ManagerBasedRlEnvCfg, ckpt_path: str
+) -> ManagerBasedRlEnvCfg:
 
   # --- Commands ------------------------------------------------------------
   cfg.commands["steering"] = mdp.SteeringCommandCfg(
@@ -57,9 +57,7 @@ def g1_forward_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   )
 
   # --- Events --------------------------------------------------------------
-  cfg.events["init_smp_state"].params["ckpt_path"] = (
-    "datasets/pretrain_ckpt/pretrained_loco.pt"
-  )
+  cfg.events["init_smp_state"].params["ckpt_path"] = ckpt_path
 
   # --- Terminations --------------------------------------------------------
   cfg.terminations["base_too_low"] = TerminationTermCfg(
@@ -71,3 +69,15 @@ def g1_forward_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   )
 
   return cfg
+
+
+def g1_forward_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Build the G1 forward environment."""
+  return _forward_smp_env_cfg(
+    g1_smp_env_cfg(play=play), "datasets/pretrain_ckpt/pretrained_loco.pt"
+  )
+
+
+def x2_forward_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Build the X2 forward environment."""
+  return _forward_smp_env_cfg(x2_smp_env_cfg(play=play), x2_loco_ckpt_path())

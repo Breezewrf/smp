@@ -1,12 +1,12 @@
 """Convert CSV motion files to windowed NPZ files.
 
 Each output NPZ contains a ``windows`` array of shape ``(N, window_size, F)``
-with the per-frame layout (59 dims for G1):
+with the following 59-dim per-frame layout for G1 and X2:
 
   root_pos        (3)              xy in last-frame heading-inv frame
                                     relative to last root; z in world
   root_rot        (6)              6D tan-norm of heading_inv(T) ⊗ root_quat[t]
-  joint_pos       (num_joints=29)  raw joint angles
+  joint_pos       (num_joints)     raw joint angles
   ee_pos          (num_ee*3=15)    end-effectors, per-frame root offset,
                                     last-frame heading-inv rotation
   root_lin_vel    (3)              last-frame heading-inv
@@ -17,18 +17,22 @@ yaw-only local frame (origin at pelvis_T, x-axis = heading_T direction).
 
 Usage:
   uv run scripts/csv_to_npz.py --input-dir datasets/csv --output-dir datasets/npz
+  uv run scripts/csv_to_npz.py --robot x2 --input-dir datasets/x2/csv \
+    --output-dir datasets/x2/npz
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
+import mujoco
 import numpy as np
 import torch
 import tyro
-from mjlab.entity import Entity
-from mjlab.scene import Scene
+from mjlab.entity import Entity, EntityCfg
+from mjlab.scene import Scene, SceneCfg
 from mjlab.scripts.csv_to_npz import MotionLoader as CsvMotionLoader
 from mjlab.sim.sim import Simulation, SimulationCfg
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
@@ -40,58 +44,33 @@ from mjlab.utils.lab_api.math import (
   yaw_quat,
 )
 
+from smp.robots import (
+  G1_EE_BODY_NAMES,
+  G1_JOINT_NAMES,
+  X2_CSV_JOINT_NAMES,
+  X2_EE_BODY_NAMES,
+  X2_JOINT_NAMES,
+)
+from smp.robots.x2 import X2_XML_PATH
 from smp.utils import detect_device
 
-# Joint name order matches the CSV column order — the 29 G1 joints.
-JOINT_NAMES: tuple[str, ...] = (
-  "left_hip_pitch_joint",
-  "left_hip_roll_joint",
-  "left_hip_yaw_joint",
-  "left_knee_joint",
-  "left_ankle_pitch_joint",
-  "left_ankle_roll_joint",
-  "right_hip_pitch_joint",
-  "right_hip_roll_joint",
-  "right_hip_yaw_joint",
-  "right_knee_joint",
-  "right_ankle_pitch_joint",
-  "right_ankle_roll_joint",
-  "waist_yaw_joint",
-  "waist_roll_joint",
-  "waist_pitch_joint",
-  "left_shoulder_pitch_joint",
-  "left_shoulder_roll_joint",
-  "left_shoulder_yaw_joint",
-  "left_elbow_joint",
-  "left_wrist_roll_joint",
-  "left_wrist_pitch_joint",
-  "left_wrist_yaw_joint",
-  "right_shoulder_pitch_joint",
-  "right_shoulder_roll_joint",
-  "right_shoulder_yaw_joint",
-  "right_elbow_joint",
-  "right_wrist_roll_joint",
-  "right_wrist_pitch_joint",
-  "right_wrist_yaw_joint",
-)
 
-NUM_JOINTS = len(JOINT_NAMES)
+@dataclass(frozen=True)
+class RobotMotionCfg:
+  csv_joint_names: tuple[str, ...]
+  joint_names: tuple[str, ...]
+  ee_body_names: tuple[str, ...]
 
-# Tracked end-effector bodies. ``torso_link`` proxies the head (head is
-# rigidly attached to the torso so the kinematic signal is the same).
-# Order must match the online RL feature buffer.
-EE_BODY_NAMES: tuple[str, ...] = (
-  "left_ankle_roll_link",
-  "right_ankle_roll_link",
-  "torso_link",
-  "left_wrist_yaw_link",
-  "right_wrist_yaw_link",
-)
-NUM_EE = len(EE_BODY_NAMES)
 
+ROBOT_CONFIGS: dict[str, RobotMotionCfg] = {
+  "g1": RobotMotionCfg(G1_JOINT_NAMES, G1_JOINT_NAMES, G1_EE_BODY_NAMES),
+  "x2": RobotMotionCfg(X2_CSV_JOINT_NAMES, X2_JOINT_NAMES, X2_EE_BODY_NAMES),
+}
 
 @dataclass
 class Cfg:
+  robot: Literal["g1", "x2"] = "g1"
+  """Robot model and corresponding CSV joint layout."""
   input_dir: str = "datasets/csv"
   """Directory of input CSV motion files."""
   output_dir: str = "datasets/npz"
@@ -112,11 +91,27 @@ class Cfg:
   """Total number of shards (for parallel runs)."""
 
 
-def _setup_sim(device: str) -> tuple[Simulation, Scene]:
-  """Build the G1 sim once."""
+def _setup_sim(device: str, robot_name: str) -> tuple[Simulation, Scene]:
+  """Build the selected robot's FK simulation once."""
   sim_cfg = SimulationCfg()
-  env_cfg = unitree_g1_flat_tracking_env_cfg()
-  scene = Scene(env_cfg.scene, device=device)
+  if robot_name == "g1":
+    scene_cfg = unitree_g1_flat_tracking_env_cfg().scene
+  elif robot_name == "x2":
+    if not X2_XML_PATH.is_file():
+      raise FileNotFoundError(f"X2 MJCF not found: {X2_XML_PATH}")
+
+    def load_x2_spec() -> mujoco.MjSpec:
+      return mujoco.MjSpec.from_file(str(X2_XML_PATH))
+
+    # FK does not require terrain, sensors, or a tracking environment.
+    scene_cfg = SceneCfg(
+      entities={"robot": EntityCfg(spec_fn=load_x2_spec)},
+      num_envs=1,
+    )
+  else:
+    raise ValueError(f"Unsupported robot: {robot_name}")
+
+  scene = Scene(scene_cfg, device=device)
   model = scene.compile()
   sim = Simulation(num_envs=1, cfg=sim_cfg, model=model, device=device)
   scene.initialize(sim.mj_model, sim.model, sim.data)
@@ -130,6 +125,8 @@ def _fk_motion(
   scene: Scene,
   joint_indexes: torch.Tensor,
   ee_indexes: torch.Tensor,
+  motion_joint_indexes: torch.Tensor,
+  expected_csv_joints: int,
   input_fps: int,
   output_fps: int,
 ) -> tuple[
@@ -149,6 +146,11 @@ def _fk_motion(
     output_fps=output_fps,
     device=sim.device,
   )
+  if motion.motion_dof_poss.shape[1] != expected_csv_joints:
+    raise ValueError(
+      f"{csv_path.name}: robot expects {expected_csv_joints} joint columns after the "
+      f"7 root-state columns, got {motion.motion_dof_poss.shape[1]}"
+    )
   robot: Entity = scene["robot"]
 
   ee_pos_list: list[torch.Tensor] = []
@@ -157,6 +159,8 @@ def _fk_motion(
   for _ in range(motion.output_frames):
     state, _ = motion.get_next_state()
     base_pos, base_rot, base_lin_vel, base_ang_vel, dof_pos, dof_vel = state
+    dof_pos = dof_pos.index_select(1, motion_joint_indexes)
+    dof_vel = dof_vel.index_select(1, motion_joint_indexes)
 
     root_states = robot.data.default_root_state.clone()
     root_states[:, 0:3] = base_pos
@@ -183,8 +187,8 @@ def _fk_motion(
     motion.motion_base_lin_vels,
     motion.motion_base_ang_vels,
     torch.stack(ee_pos_list),
-    motion.motion_dof_poss,
-    motion.motion_dof_vels,
+    motion.motion_dof_poss.index_select(1, motion_joint_indexes),
+    motion.motion_dof_vels.index_select(1, motion_joint_indexes),
   )
 
 
@@ -294,6 +298,13 @@ def main(cfg: Cfg) -> None:
     cfg.device = detect_device()
   print(f"Device: {cfg.device}")
 
+  robot_motion_cfg = ROBOT_CONFIGS[cfg.robot]
+  csv_joint_names = robot_motion_cfg.csv_joint_names
+  joint_names = robot_motion_cfg.joint_names
+  ee_body_names = robot_motion_cfg.ee_body_names
+  num_joints = len(joint_names)
+  num_ee = len(ee_body_names)
+
   in_dir = Path(cfg.input_dir)
   out_dir = Path(cfg.output_dir)
   out_dir.mkdir(parents=True, exist_ok=True)
@@ -306,29 +317,46 @@ def main(cfg: Cfg) -> None:
     csv_files = csv_files[cfg.shard_index :: cfg.num_shards]
     print(f"Shard {cfg.shard_index}/{cfg.num_shards}: {len(csv_files)} files")
 
-  sim, scene = _setup_sim(cfg.device)
+  sim, scene = _setup_sim(cfg.device, cfg.robot)
   robot: Entity = scene["robot"]
   joint_indexes = torch.tensor(
-    robot.find_joints(list(JOINT_NAMES), preserve_order=True)[0],
+    robot.find_joints(list(joint_names), preserve_order=True)[0],
     dtype=torch.long,
     device=sim.device,
   )
   ee_indexes = torch.tensor(
-    robot.find_bodies(list(EE_BODY_NAMES), preserve_order=True)[0],
+    robot.find_bodies(list(ee_body_names), preserve_order=True)[0],
     dtype=torch.long,
     device=sim.device,
   )
+  motion_joint_indexes = torch.tensor(
+    [csv_joint_names.index(name) for name in joint_names],
+    dtype=torch.long,
+    device=sim.device,
+  )
+  if joint_indexes.numel() != num_joints:
+    raise ValueError(
+      f"{cfg.robot}: found {joint_indexes.numel()} of {num_joints} configured joints"
+    )
+  if ee_indexes.numel() != num_ee:
+    raise ValueError(
+      f"{cfg.robot}: found {ee_indexes.numel()} of {num_ee} configured end-effectors"
+    )
 
-  feature_dims = [3, 6, NUM_JOINTS, NUM_EE * 3, 3, 3]
+  feature_dims = [3, 6, num_joints, num_ee * 3, 3, 3]
   total_feature_dim = sum(feature_dims)
 
+  print(f"Robot: {cfg.robot}")
   print(f"Files: {len(csv_files)} in {in_dir}")
   print(f"Output: {out_dir}")
   print(f"Window: size={cfg.window_size} stride={cfg.stride} fps={cfg.output_fps}")
-  print(f"End-effectors: {NUM_EE} {EE_BODY_NAMES} | Joints: {NUM_JOINTS}")
+  print(
+    f"End-effectors: {num_ee} {ee_body_names} | "
+    f"CSV joints: {len(csv_joint_names)} | Output joints: {num_joints}"
+  )
   print(
     f"Feature dim: {total_feature_dim} "
-    f"(= 3 root_pos + 6 root_rot + {NUM_JOINTS} joint_pos + {NUM_EE * 3} "
+    f"(= 3 root_pos + 6 root_rot + {num_joints} joint_pos + {num_ee * 3} "
     f"ee_pos + 3 lin_vel + 3 ang_vel)"
   )
 
@@ -348,12 +376,14 @@ def main(cfg: Cfg) -> None:
       scene,
       joint_indexes,
       ee_indexes,
+      motion_joint_indexes,
+      expected_csv_joints=len(csv_joint_names),
       input_fps=cfg.input_fps,
       output_fps=cfg.output_fps,
     )
-    if joint_pos.shape[-1] != NUM_JOINTS:
+    if joint_pos.shape[-1] != num_joints:
       msg = (
-        f"{csv_path.name}: expected {NUM_JOINTS} dof columns, got {joint_pos.shape[-1]}"
+        f"{csv_path.name}: expected {num_joints} dof columns, got {joint_pos.shape[-1]}"
       )
       raise ValueError(msg)
     del joint_vel
@@ -378,7 +408,10 @@ def main(cfg: Cfg) -> None:
       fps=np.array([cfg.output_fps], dtype=np.float32),
       window_size=np.array([cfg.window_size], dtype=np.int32),
       stride=np.array([cfg.stride], dtype=np.int32),
-      ee_body_names=np.array(EE_BODY_NAMES),
+      robot=np.array([cfg.robot]),
+      source_joint_names=np.array(csv_joint_names),
+      joint_names=np.array(joint_names),
+      ee_body_names=np.array(ee_body_names),
       feature_dims=np.array(feature_dims, dtype=np.int32),
     )
     print(f"  saved {out_path.name}: windows={tuple(windows.shape)}")

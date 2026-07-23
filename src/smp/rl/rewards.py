@@ -20,6 +20,7 @@ def _update_buffer_from_sim(env: ManagerBasedRlEnv) -> None:
   """Push current sim kinematics onto the buffer tail, env-origin-relative
   (matching ``_prime_sim_and_buffer``) so features are placement-invariant."""
   robot = env.scene["robot"]
+  joint_indexes = env._smp_joint_indexes  # type: ignore[attr-defined]
   ee_indexes = env._smp_ee_indexes  # type: ignore[attr-defined]
   buffer: MotionFeatureBuffer = env._smp_buffer  # type: ignore[attr-defined]
   origins = env.scene.env_origins
@@ -29,8 +30,8 @@ def _update_buffer_from_sim(env: ManagerBasedRlEnv) -> None:
     robot.data.root_link_lin_vel_w,
     robot.data.root_link_ang_vel_w,
     robot.data.body_link_pos_w[:, ee_indexes] - origins[:, None, :],
-    robot.data.joint_pos,
-    robot.data.joint_vel,
+    robot.data.joint_pos[:, joint_indexes],
+    robot.data.joint_vel[:, joint_indexes],
   )
 
 

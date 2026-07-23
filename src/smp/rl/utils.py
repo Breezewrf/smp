@@ -21,9 +21,17 @@ from smp.pretrain.scheduler import DDPMScheduler
 def load_denoiser(
   ckpt_path: str,
   device: torch.device | str,
-) -> tuple[DiffusionDenoiser, DDPMScheduler, torch.Tensor, torch.Tensor, int, int]:
+) -> tuple[
+  DiffusionDenoiser,
+  DDPMScheduler,
+  torch.Tensor,
+  torch.Tensor,
+  int,
+  int,
+  dict[str, Any],
+]:
   """Load a frozen pretrained denoiser checkpoint → ``(model, scheduler, q_low,
-  q_high, feature_dim, window_size)``."""
+  q_high, feature_dim, window_size, checkpoint_cfg)``."""
   device = torch.device(device)
 
   ckpt: dict[str, Any] = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -51,7 +59,7 @@ def load_denoiser(
   q_low = torch.from_numpy(np.asarray(ckpt["q_low"], dtype=np.float32)).to(device)
   q_high = torch.from_numpy(np.asarray(ckpt["q_high"], dtype=np.float32)).to(device)
 
-  return model, scheduler, q_low, q_high, feature_dim, window_size
+  return model, scheduler, q_low, q_high, feature_dim, window_size, cfg
 
 
 class DiffNormalizer:

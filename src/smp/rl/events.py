@@ -13,14 +13,8 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.utils.lab_api.math import quat_apply, quat_mul, yaw_quat
 
 from smp.rl.utils import DiffNormalizer, MotionFeatureBuffer, load_denoiser
-from smp.sampling.feature_to_state import (
-  EE_BODY_NAMES,
-  NUM_EE,
-  rot6d_to_quat,
-  slice_features,
-)
-
-NUM_JOINTS = 29
+from smp.robots import G1_EE_BODY_NAMES, G1_JOINT_NAMES
+from smp.sampling.feature_to_state import rot6d_to_quat, slice_features
 
 
 def _maybe_compile(model, compile_model: bool, compile_mode: str | None):
@@ -48,6 +42,9 @@ def init_smp_state(
   gsi_batch_size: int = 256,
   compile_model: bool = True,
   compile_mode: str | None = None,
+  robot_name: str = "g1",
+  joint_names: tuple[str, ...] = G1_JOINT_NAMES,
+  ee_body_names: tuple[str, ...] = G1_EE_BODY_NAMES,
 ) -> None:
   """Startup-mode event: load the frozen denoiser, allocate the feature buffer +
   ``DiffNormalizer`` (stashed on the env), and pre-generate the GSI pool of
@@ -62,9 +59,40 @@ def init_smp_state(
       "params={'ckpt_path': '/path/to/pretrained.pt'})."
     )
     raise RuntimeError(msg)
-  model, scheduler, q_low, q_high, feature_dim, window_size = load_denoiser(
-    ckpt_path, env.device
-  )
+  (
+    model,
+    scheduler,
+    q_low,
+    q_high,
+    feature_dim,
+    window_size,
+    checkpoint_cfg,
+  ) = load_denoiser(ckpt_path, env.device)
+  num_joints = len(joint_names)
+  num_ee = len(ee_body_names)
+  expected_feature_dim = 3 + 6 + num_joints + num_ee * 3 + 3 + 3
+  if feature_dim != expected_feature_dim:
+    raise ValueError(
+      f"SMP checkpoint feature_dim={feature_dim}, but the configured robot "
+      f"layout requires {expected_feature_dim} ({num_joints} joints, {num_ee} EEs)"
+    )
+  metadata_checks = {
+    "robot": robot_name,
+    "joint_names": joint_names,
+    "ee_body_names": ee_body_names,
+  }
+  for field_name, expected in metadata_checks.items():
+    actual = checkpoint_cfg.get(field_name)
+    mismatch = (
+      actual != expected
+      if field_name == "robot"
+      else actual is not None and tuple(actual) != tuple(expected)
+    )
+    if actual is not None and mismatch:
+      raise ValueError(
+        f"SMP checkpoint {field_name}={actual!r} does not match "
+        f"the configured robot's {expected!r}"
+      )
   model = _maybe_compile(model, compile_model, compile_mode)
   env._smp_bundle = (  # type: ignore[attr-defined]
     model,
@@ -75,16 +103,31 @@ def init_smp_state(
     window_size,
   )
   robot = env.scene["robot"]
-  env._smp_ee_indexes = torch.tensor(  # type: ignore[attr-defined]
-    robot.find_bodies(list(EE_BODY_NAMES), preserve_order=True)[0],
+  joint_indexes = robot.find_joints(list(joint_names), preserve_order=True)[0]
+  ee_indexes = robot.find_bodies(list(ee_body_names), preserve_order=True)[0]
+  if len(joint_indexes) != num_joints:
+    raise ValueError(
+      f"Found {len(joint_indexes)} of {num_joints} configured SMP joints"
+    )
+  if len(ee_indexes) != num_ee:
+    raise ValueError(f"Found {len(ee_indexes)} of {num_ee} configured SMP bodies")
+  env._smp_joint_indexes = torch.tensor(  # type: ignore[attr-defined]
+    joint_indexes,
     dtype=torch.long,
     device=env.device,
   )
+  env._smp_ee_indexes = torch.tensor(  # type: ignore[attr-defined]
+    ee_indexes,
+    dtype=torch.long,
+    device=env.device,
+  )
+  env._smp_num_joints = num_joints  # type: ignore[attr-defined]
+  env._smp_num_ee = num_ee  # type: ignore[attr-defined]
   env._smp_buffer = MotionFeatureBuffer(  # type: ignore[attr-defined]
     num_envs=env.num_envs,
     window_size=window_size,
-    num_joints=NUM_JOINTS,
-    num_ee=NUM_EE,
+    num_joints=num_joints,
+    num_ee=num_ee,
     device=env.device,
   )
   env._smp_normalizer = DiffNormalizer(scheduler.num_timesteps, env.device)  # type: ignore[attr-defined]
@@ -118,8 +161,9 @@ def _prime_sim_and_buffer(
   the sim write adds each env's origin so robots spread across the grid.
   ``joint_vel`` is finite-differenced from ``joint_pos`` (not in the window)."""
   n, W, _ = window.shape
-  E = NUM_EE
-  parts = slice_features(window)
+  J = env._smp_num_joints  # type: ignore[attr-defined]
+  E = env._smp_num_ee  # type: ignore[attr-defined]
+  parts = slice_features(window, num_joints=J, num_ee=E)
   root_pos_local = parts["root_pos"]
   root_rot_6d = parts["root_rot"]
   joint_pos = parts["joint_pos"]
@@ -172,7 +216,12 @@ def _prime_sim_and_buffer(
     dim=-1,
   )
   robot.write_root_state_to_sim(last_root_state, env_ids=env_ids)
-  robot.write_joint_state_to_sim(joint_pos[:, -1], joint_vel[:, -1], env_ids=env_ids)
+  robot.write_joint_state_to_sim(
+    joint_pos[:, -1],
+    joint_vel[:, -1],
+    joint_ids=env._smp_joint_indexes,  # type: ignore[attr-defined]
+    env_ids=env_ids,
+  )
 
   buf: MotionFeatureBuffer = env._smp_buffer  # type: ignore[attr-defined]
   buf.reset(

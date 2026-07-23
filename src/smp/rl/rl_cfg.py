@@ -5,7 +5,7 @@ from mjlab.rl import (
 )
 
 
-def unitree_g1_smp_ppo_runner_cfg():
+def smp_ppo_runner_cfg(robot_name: str = "g1"):
   return RslRlOnPolicyRunnerCfg(
     actor=RslRlModelCfg(
       hidden_dims=(512, 256, 128),
@@ -37,9 +37,17 @@ def unitree_g1_smp_ppo_runner_cfg():
       desired_kl=0.01,
       max_grad_norm=1.0,
     ),
-    experiment_name="g1_tracking",
+    experiment_name=f"{robot_name}_tracking",
     save_interval=500,
     num_steps_per_env=24,
     max_iterations=30_000,
     wandb_project="smp",
   )
+
+
+def unitree_g1_smp_ppo_runner_cfg():
+  return smp_ppo_runner_cfg("g1")
+
+
+def agibot_x2_smp_ppo_runner_cfg():
+  return smp_ppo_runner_cfg("x2")

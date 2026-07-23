@@ -18,36 +18,31 @@ from mjlab.utils.lab_api.math import (
   yaw_quat,
 )
 
-NUM_JOINTS = 29
+from smp.robots import G1_EE_BODY_NAMES, G1_JOINT_NAMES
 
-# Tracked end-effector bodies. ``torso_link`` proxies the head (mjlab's G1
-# asset has no separate head body, but the head is rigidly attached to the
-# torso so the kinematic signal is the same).  Order must match
-# ``scripts/csv_to_npz.py::EE_BODY_NAMES``.
-EE_BODY_NAMES: tuple[str, ...] = (
-  "left_ankle_roll_link",
-  "right_ankle_roll_link",
-  "torso_link",
-  "left_wrist_yaw_link",
-  "right_wrist_yaw_link",
-)
+NUM_JOINTS = len(G1_JOINT_NAMES)
+EE_BODY_NAMES = G1_EE_BODY_NAMES
 NUM_EE = len(EE_BODY_NAMES)
 
 
-def slice_features(frame: torch.Tensor) -> dict[str, torch.Tensor]:
+def slice_features(
+  frame: torch.Tensor,
+  num_joints: int = NUM_JOINTS,
+  num_ee: int = NUM_EE,
+) -> dict[str, torch.Tensor]:
   """Slice a feature vector into named components.
 
   Layout (matches ``scripts/csv_to_npz.py::_compute_windows``):
     [0:3]                   root_pos       xy in last-frame heading-inv, z world
     [3:9]                   root_rot       6D tan-norm of heading_inv(T) ⊗ root_quat[t]
-    [9:9+J]                 joint_pos      raw joint angles (J = 29 for G1)
+    [9:9+J]                 joint_pos      raw joint angles
     [9+J:9+J+E*3]           ee_pos         per-frame root offset, last-frame
                                            heading-inv rotation (E = 5)
     [9+J+E*3:12+J+E*3]      root_lin_vel   last-frame heading-inv
     [12+J+E*3:15+J+E*3]     root_ang_vel   last-frame heading-inv
   """
-  J = NUM_JOINTS
-  E = NUM_EE
+  J = num_joints
+  E = num_ee
   expected = 3 + 6 + J + E * 3 + 3 + 3
   if frame.shape[-1] != expected:
     msg = f"expected feature_dim={expected}; got {frame.shape[-1]}"

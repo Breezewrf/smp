@@ -1,4 +1,4 @@
-"""G1 location task with SMP guidance.
+"""Location task with SMP guidance.
 
 Each env gets a periodically-resampled world-frame xy goal; reward is
 position-tracking gated by the SMP guidance reward.
@@ -12,14 +12,14 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 
-from smp.rl.env_cfg import g1_smp_env_cfg
+from smp.rl.env_cfg import g1_smp_env_cfg, x2_loco_ckpt_path, x2_smp_env_cfg
 from smp.rl.rewards import task_smp_product
 from smp.rl.tasks.location import mdp
 
 
-def g1_location_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  """Build the G1 location env cfg with SMP guidance."""
-  cfg = g1_smp_env_cfg(play=play)
+def _location_smp_env_cfg(
+  cfg: ManagerBasedRlEnvCfg, ckpt_path: str
+) -> ManagerBasedRlEnvCfg:
 
   # --- Commands ------------------------------------------------------------
   cfg.commands["location"] = mdp.LocationCommandCfg(
@@ -56,9 +56,7 @@ def g1_location_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   )
 
   # --- Events --------------------------------------------------------------
-  cfg.events["init_smp_state"].params["ckpt_path"] = (
-    "datasets/pretrain_ckpt/pretrained_lafan_run.pt"
-  )
+  cfg.events["init_smp_state"].params["ckpt_path"] = ckpt_path
 
   # --- Terminations --------------------------------------------------------
   cfg.terminations["base_too_low"] = TerminationTermCfg(
@@ -70,3 +68,15 @@ def g1_location_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   )
 
   return cfg
+
+
+def g1_location_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Build the G1 location environment."""
+  return _location_smp_env_cfg(
+    g1_smp_env_cfg(play=play), "datasets/pretrain_ckpt/pretrained_lafan_run.pt"
+  )
+
+
+def x2_location_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Build the X2 location environment."""
+  return _location_smp_env_cfg(x2_smp_env_cfg(play=play), x2_loco_ckpt_path())

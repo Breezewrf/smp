@@ -1,4 +1,4 @@
-"""Shared G1 + SMP guidance env config.
+"""Shared humanoid + SMP guidance environment configurations.
 
 The SMP feature buffer and frozen denoiser are attached to the stock
 ``ManagerBasedRlEnv`` via the startup/reset events in ``smp.rl.events``.
@@ -7,10 +7,13 @@ Per-task configs extend this with task-specific commands/observations/rewards.
 
 from __future__ import annotations
 
+import os
+
 from mjlab.asset_zoo.robots import (
   G1_ACTION_SCALE,
   get_g1_robot_cfg,
 )
+from mjlab.entity import EntityCfg
 from mjlab.envs import ManagerBasedRlEnvCfg, mdp
 from mjlab.envs.mdp import dr, time_out
 from mjlab.envs.mdp.actions import JointPositionActionCfg
@@ -34,22 +37,50 @@ from smp.rl.events import (
   gsi_reset,
   init_smp_state,
 )
+from smp.robots import (
+  G1_EE_BODY_NAMES,
+  G1_JOINT_NAMES,
+  X2_ACTION_SCALE,
+  X2_EE_BODY_NAMES,
+  X2_JOINT_NAMES,
+  get_x2_robot_cfg,
+)
+
+DEFAULT_X2_LOCO_CKPT = "logs/pretrain/x2_lafan_loco/checkpoint_05000.pt"
 
 
-def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  """Build the shared G1 + SMP env cfg (denoiser ckpt path set on
-  ``init_smp_state`` below; override it from the task config)."""
+def x2_loco_ckpt_path() -> str:
+  """Resolve the X2 prior, allowing local training runs via ``SMP_X2_CKPT``."""
+  return os.environ.get("SMP_X2_CKPT", DEFAULT_X2_LOCO_CKPT)
+
+
+def _smp_env_cfg(
+  *,
+  robot_name: str,
+  robot_cfg: EntityCfg,
+  joint_names: tuple[str, ...],
+  ee_body_names: tuple[str, ...],
+  action_scale: dict[str, float],
+  lin_vel_sensor: str,
+  ang_vel_sensor: str,
+  foot_geom_names: str,
+  play: bool,
+) -> ManagerBasedRlEnvCfg:
+  """Build a shared SMP environment for a configured humanoid."""
+  joint_asset_cfg = SceneEntityCfg(
+    "robot", joint_names=joint_names, preserve_order=True
+  )
 
   # --- Observations --------------------------------------------------------
   actor_terms = {
     "base_lin_vel": ObservationTermCfg(
       func=mdp.builtin_sensor,
-      params={"sensor_name": "robot/imu_lin_vel"},
+      params={"sensor_name": lin_vel_sensor},
       noise=Unoise(n_min=-0.5, n_max=0.5),
     ),
     "base_ang_vel": ObservationTermCfg(
       func=mdp.builtin_sensor,
-      params={"sensor_name": "robot/imu_ang_vel"},
+      params={"sensor_name": ang_vel_sensor},
       noise=Unoise(n_min=-0.2, n_max=0.2),
     ),
     "projected_gravity": ObservationTermCfg(
@@ -58,10 +89,12 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     ),
     "joint_pos": ObservationTermCfg(
       func=mdp.joint_pos_rel,
+      params={"asset_cfg": joint_asset_cfg},
       noise=Unoise(n_min=-0.01, n_max=0.01),
     ),
     "joint_vel": ObservationTermCfg(
       func=mdp.joint_vel_rel,
+      params={"asset_cfg": joint_asset_cfg},
       noise=Unoise(n_min=-1.5, n_max=1.5),
     ),
     "actions": ObservationTermCfg(func=mdp.last_action),
@@ -89,8 +122,8 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   actions: dict[str, ActionTermCfg] = {
     "joint_pos": JointPositionActionCfg(
       entity_name="robot",
-      actuator_names=(".*",),
-      scale=G1_ACTION_SCALE,
+      actuator_names=joint_names,
+      scale=action_scale,
       use_default_offset=True,
     )
   }
@@ -109,6 +142,9 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "gsi_batch_size": 1024,
         "compile_model": True,
         "compile_mode": "max-autotune",
+        "robot_name": robot_name,
+        "joint_names": joint_names,
+        "ee_body_names": ee_body_names,
       },
     ),
     "gsi_reset": EventTermCfg(func=gsi_reset, mode="reset", params={}),
@@ -136,9 +172,7 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       mode="startup",
       func=dr.geom_friction,
       params={
-        "asset_cfg": SceneEntityCfg(
-          "robot", geom_names=r"^(left|right)_foot[1-7]_collision$"
-        ),
+        "asset_cfg": SceneEntityCfg("robot", geom_names=foot_geom_names),
         "operation": "abs",
         "ranges": (0.3, 1.2),
         "shared_random": True,  # All foot geoms share the same friction.
@@ -148,7 +182,7 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       mode="startup",
       func=dr.encoder_bias,
       params={
-        "asset_cfg": SceneEntityCfg("robot"),
+        "asset_cfg": joint_asset_cfg,
         "bias_range": (-0.015, 0.015),
       },
     ),
@@ -194,7 +228,7 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg = ManagerBasedRlEnvCfg(
     scene=SceneCfg(
       terrain=TerrainEntityCfg(terrain_type="plane"),
-      entities={"robot": get_g1_robot_cfg()},
+      entities={"robot": robot_cfg},
       num_envs=1,
       extent=2.0,
       sensors=(self_collision_cfg,),
@@ -234,3 +268,33 @@ def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.events["init_smp_state"].params["gsi_buffer_size"] = 1024
 
   return cfg
+
+
+def g1_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Build the shared G1 + SMP environment configuration."""
+  return _smp_env_cfg(
+    robot_name="g1",
+    robot_cfg=get_g1_robot_cfg(),
+    joint_names=G1_JOINT_NAMES,
+    ee_body_names=G1_EE_BODY_NAMES,
+    action_scale=G1_ACTION_SCALE,
+    lin_vel_sensor="robot/imu_lin_vel",
+    ang_vel_sensor="robot/imu_ang_vel",
+    foot_geom_names=r"^(left|right)_foot[1-7]_collision$",
+    play=play,
+  )
+
+
+def x2_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Build the shared 29-DoF X2 + SMP environment configuration."""
+  return _smp_env_cfg(
+    robot_name="x2",
+    robot_cfg=get_x2_robot_cfg(),
+    joint_names=X2_JOINT_NAMES,
+    ee_body_names=X2_EE_BODY_NAMES,
+    action_scale=X2_ACTION_SCALE,
+    lin_vel_sensor="robot/body-linear-vel",
+    ang_vel_sensor="robot/body-angular-velocity",
+    foot_geom_names=r"^(left|right)_ankle_roll_link_collision_.*$",
+    play=play,
+  )

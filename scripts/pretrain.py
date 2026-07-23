@@ -77,16 +77,23 @@ def _save_checkpoint(
   optimizer: torch.optim.Optimizer | None = None,
   ema: _Ema | None = None,
 ) -> None:
+  checkpoint_cfg = {
+    **vars(cfg),
+    "feature_dim": feature_dim,
+    "window_size": dataset.window_size,
+  }
+  if dataset.robot is not None:
+    checkpoint_cfg["robot"] = dataset.robot
+  if dataset.joint_names is not None:
+    checkpoint_cfg["joint_names"] = dataset.joint_names
+  if dataset.ee_body_names is not None:
+    checkpoint_cfg["ee_body_names"] = dataset.ee_body_names
   data: dict[str, Any] = {
     "epoch": epoch,
     "model": model.state_dict(),
     "q_low": dataset.q_low,
     "q_high": dataset.q_high,
-    "cfg": {
-      **vars(cfg),
-      "feature_dim": feature_dim,
-      "window_size": dataset.window_size,
-    },
+    "cfg": checkpoint_cfg,
   }
   if optimizer is not None:
     data["optimizer"] = optimizer.state_dict()

@@ -28,9 +28,23 @@ class MotionWindowDataset(Dataset[torch.Tensor]):
 
     chunks: list[np.ndarray] = []
     expected_shape: tuple[int, int] | None = None
+    self.robot: str | None = None
+    self.joint_names: tuple[str, ...] | None = None
+    self.ee_body_names: tuple[str, ...] | None = None
     for npz_file in npz_files:
       with np.load(npz_file, allow_pickle=False) as npz:
         windows = npz["windows"].astype(np.float32, copy=False)
+        robot = str(npz["robot"].reshape(-1)[0]) if "robot" in npz else None
+        joint_names = (
+          tuple(str(name) for name in npz["joint_names"])
+          if "joint_names" in npz
+          else None
+        )
+        ee_body_names = (
+          tuple(str(name) for name in npz["ee_body_names"])
+          if "ee_body_names" in npz
+          else None
+        )
       if windows.ndim != 3:
         msg = (
           f"{npz_file.name}: 'windows' has shape {windows.shape}, expected (N, W, S)"
@@ -44,6 +58,19 @@ class MotionWindowDataset(Dataset[torch.Tensor]):
           f"first file's (*, {expected_shape[0]}, {expected_shape[1]})"
         )
         raise ValueError(msg)
+      for field_name, value in (
+        ("robot", robot),
+        ("joint_names", joint_names),
+        ("ee_body_names", ee_body_names),
+      ):
+        expected = getattr(self, field_name)
+        if expected is None:
+          setattr(self, field_name, value)
+        elif value != expected:
+          raise ValueError(
+            f"{npz_file.name}: {field_name}={value!r} does not match "
+            f"the first file's {expected!r}"
+          )
       chunks.append(windows)
 
     assert expected_shape is not None

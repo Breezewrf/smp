@@ -137,7 +137,7 @@ why a wide normalizer matters.
 
 ## RL
 
-Four downstream tasks are registered with `mjlab.tasks.registry` (importing
+Seven downstream tasks are registered with `mjlab.tasks.registry` (importing
 `smp.rl.tasks` self-registers them):
 
 | Task              | Demo | Description                              |
@@ -146,6 +146,9 @@ Four downstream tasks are registered with `mjlab.tasks.registry` (importing
 | `Smp-Steering-G1` | <img src="https://raw.githubusercontent.com/SUZ-tsinghua/smp/assets/steering.gif" width="200"/> | track a commanded velocity + facing direction |
 | `Smp-Location-G1` | <img src="https://raw.githubusercontent.com/SUZ-tsinghua/smp/assets/location.gif" width="200"/> | walk to a world-frame xy goal |
 | `Smp-Getup-G1`    | <img src="https://raw.githubusercontent.com/SUZ-tsinghua/smp/assets/getup.gif" width="200"/> | stand up from a fallen pose |
+| `Smp-Forward-X2`  | | X2 walk / jog / run at a commanded `+x` speed |
+| `Smp-Steering-X2` | | X2 target velocity + facing direction tracking |
+| `Smp-Location-X2` | | X2 world-frame xy goal tracking |
 
 ### Train / play
 
@@ -157,8 +160,27 @@ uv run scripts/train.py Smp-Forward-G1 --env.scene.num-envs=4096
 uv run scripts/play.py Smp-Forward-G1 --wandb-run-path <org>/<project>/<run> --num-envs 4
 ```
 
-Swap the task id for any of the four. Because the priors are shipped and already
-wired into each env config, no editing is required before training.
+Swap the task id for another registered task. The G1 priors are shipped and
+already wired into each G1 environment config.
+
+For X2, place the trained X2 locomotion prior at
+`datasets/pretrain_ckpt/pretrained_x2_loco.pt`, then run:
+
+```bash
+uv run scripts/train.py Smp-Forward-X2 --env.scene.num-envs=4096
+```
+
+During local iteration, `SMP_X2_CKPT` can point directly to a pretraining run
+without moving the checkpoint:
+
+```bash
+SMP_X2_CKPT=logs/pretrain/x2_lafan_loco/<timestamp>/pretrained.pt \
+  uv run scripts/train.py Smp-Forward-X2 --env.scene.num-envs=4096
+```
+
+The X2 RL asset physically fixes the two head joints and exposes 29 actuated
+joints. Its locomotion collision model uses the 24 foot contact points; the
+full-body visual meshes are not used for physical contact.
 
 ### Reward design: `task × SMP`
 
@@ -218,8 +240,8 @@ the guidance reward is invariant to where the env sits in the world grid.
 ### Motion features
 
 The guidance reward scores a rolling window of motion features rebuilt online by
-`smp.rl.utils.MotionFeatureBuffer`, matching the pretraining layout (59-dim/frame
-for G1), anchored to the last frame's yaw-only local frame:
+`smp.rl.utils.MotionFeatureBuffer`, matching the 59-dim/frame pretraining layout
+for G1 and X2, anchored to the last frame's yaw-only local frame:
 
 ```
 [root_pos(3), root_rot(6), joint_pos(29), ee_pos(15), root_lin_vel(3), root_ang_vel(3)]
