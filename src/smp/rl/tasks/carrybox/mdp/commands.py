@@ -55,6 +55,9 @@ class CarryBoxCommand(CommandTerm):
     self.metrics["pickup_gate"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["carry_gate"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["place_gate"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["hand_score"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["lift_score"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["held_score"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["pickup_task"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["carry_task"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["place_task"] = torch.zeros(self.num_envs, device=self.device)
@@ -111,6 +114,9 @@ class CarryBoxCommand(CommandTerm):
       "pickup_gate",
       "carry_gate",
       "place_gate",
+      "hand_score",
+      "lift_score",
+      "held_score",
       "pickup_task",
       "carry_task",
       "place_task",

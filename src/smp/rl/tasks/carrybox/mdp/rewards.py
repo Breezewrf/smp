@@ -213,9 +213,13 @@ def stage_gated_carrybox_task(
   place_speed_err_scale: float = 1.0,
   pickup_robot_weight: float = 0.15,
   pickup_hand_weight: float = 0.45,
-  pickup_lift_weight: float = 0.80,
+  pickup_height_weight: float = 0.8,
+  pickup_lift_weight: float = 1.00,
   carry_progress_weight: float = 0.90,
   carry_goal_weight: float = 0.45,
+  carry_hand_weight: float = 0.25,
+  carry_height_weight: float = 0.40,
+  carry_held_weight: float = 0.30,
   place_goal_weight: float = 0.60,
   place_down_weight: float = 1.25,
   reset_stage_gate_weight: float = 0.35,
@@ -252,6 +256,7 @@ def stage_gated_carrybox_task(
     held_score=held_score,
     score_threshold=lift_memory_threshold,
   )
+  current_lift_gate = lift_score
 
   progress = cmd._progress_fraction(box_pos)  # noqa: SLF001
   goal_err = torch.norm(cmd.target_pos_w[:, :2] - box_pos[:, :2], dim=-1)
@@ -272,8 +277,12 @@ def stage_gated_carrybox_task(
   carry_reset = (reset_stage == CARRYBOX_STAGE_IDS["carry"]).float()
   place_reset = (reset_stage == CARRYBOX_STAGE_IDS["place"]).float()
 
-  pickup_gate = (1.0 - has_lifted) * (1.0 + reset_stage_gate_weight * pickup_reset)
-  carry_gate = has_lifted * (1.0 - near_goal) * (
+  # has_lifted is intentionally a memory term for place resets. Carry should
+  # depend on the current lifted state so dropping the box re-opens pickup.
+  pickup_gate = (1.0 - current_lift_gate) * (1.0 - near_goal) * (
+    1.0 + reset_stage_gate_weight * pickup_reset
+  )
+  carry_gate = current_lift_gate * (1.0 - near_goal) * (
     1.0 + reset_stage_gate_weight * carry_reset
   )
   place_gate = has_lifted * near_goal * (1.0 + reset_stage_gate_weight * place_reset)
@@ -281,11 +290,15 @@ def stage_gated_carrybox_task(
   pickup_task = (
     pickup_robot_weight * robot_score
     + pickup_hand_weight * hand_score
+    + pickup_height_weight * lift_score
     + pickup_lift_weight * held_score
   )
   carry_task = (
-    carry_progress_weight * progress * held_score
-    + carry_goal_weight * goal_score * held_score
+    carry_progress_weight * progress * lift_score
+    + carry_goal_weight * goal_score * lift_score
+    + carry_hand_weight * hand_score * current_lift_gate
+    + carry_height_weight * lift_score
+    + carry_held_weight * held_score
   )
   place_task = (
     place_goal_weight * goal_score * has_lifted
@@ -296,6 +309,9 @@ def stage_gated_carrybox_task(
   _set_metric(env, "pickup_gate", pickup_gate.clamp(0.0, 1.0))
   _set_metric(env, "carry_gate", carry_gate.clamp(0.0, 1.0))
   _set_metric(env, "place_gate", place_gate.clamp(0.0, 1.0))
+  _set_metric(env, "hand_score", hand_score)
+  _set_metric(env, "lift_score", lift_score)
+  _set_metric(env, "held_score", held_score)
   _set_metric(env, "pickup_task", pickup_task)
   _set_metric(env, "carry_task", carry_task)
   _set_metric(env, "place_task", place_task)
