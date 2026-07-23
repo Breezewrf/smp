@@ -1,6 +1,9 @@
-"""G1 getup task with SMP guidance."""
+"""G1 and X2 getup tasks with SMP guidance."""
 
 from __future__ import annotations
+
+import os
+from collections.abc import Callable
 
 import mujoco
 from mjlab.asset_zoo.robots.unitree_g1.g1_constants import get_spec as _get_g1_spec
@@ -9,12 +12,23 @@ from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 
-from smp.rl.env_cfg import g1_smp_env_cfg
+from smp.rl.env_cfg import g1_smp_env_cfg, x2_smp_env_cfg
 from smp.rl.rewards import task_smp_product
 from smp.rl.tasks.getup import mdp
+from smp.robots.x2 import get_x2_spec_with_body_collisions
 
 # Matches the existing ``head_collision`` geom on ``torso_link`` in g1.xml.
 HEAD_POS_IN_TORSO: tuple[float, float, float] = (0.0, 0.0, 0.43)
+# The fixed X2 head body's origin is near its centre; offset the reward site to
+# the top of its collision cylinder.
+HEAD_POS_IN_X2_HEAD: tuple[float, float, float] = (0.0, 0.0, 0.08)
+
+DEFAULT_X2_GETUP_CKPT = "datasets/pretrain_ckpt/pretrained_getup_x2.pt"
+
+
+def x2_getup_ckpt_path() -> str:
+  """Resolve the X2 getup prior, allowing direct use of pretraining runs."""
+  return os.environ.get("SMP_X2_GETUP_CKPT", DEFAULT_X2_GETUP_CKPT)
 
 
 def get_g1_spec_with_head() -> mujoco.MjSpec:  # type: ignore[attr-defined]
@@ -26,17 +40,27 @@ def get_g1_spec_with_head() -> mujoco.MjSpec:  # type: ignore[attr-defined]
   return spec
 
 
-def g1_getup_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  """Build the G1 getup env cfg with SMP guidance."""
-  cfg = g1_smp_env_cfg(play=play)
+def get_x2_getup_spec() -> mujoco.MjSpec:
+  """Fixed-head X2 spec with full-body terrain contact and a head site."""
+  spec = get_x2_spec_with_body_collisions()
+  head = spec.body("head_pitch_link")
+  if not any(site.name == "head" for site in head.sites):
+    head.add_site(name="head", pos=HEAD_POS_IN_X2_HEAD)
+  return spec
+
+
+def _getup_smp_env_cfg(
+  cfg: ManagerBasedRlEnvCfg,
+  ckpt_path: str,
+  spec_fn: Callable[[], mujoco.MjSpec],
+) -> ManagerBasedRlEnvCfg:
+  """Add robot-independent getup events, rewards, and terminations."""
 
   # --- Scene ---------------------------------------------------------------
-  cfg.scene.entities["robot"].spec_fn = get_g1_spec_with_head
+  cfg.scene.entities["robot"].spec_fn = spec_fn
 
   # --- Events --------------------------------------------------------------
-  cfg.events["init_smp_state"].params["ckpt_path"] = (
-    "datasets/pretrain_ckpt/pretrained_getup_f2s2.pt"
-  )
+  cfg.events["init_smp_state"].params["ckpt_path"] = ckpt_path
   cfg.events["reset_stand_counter"] = EventTermCfg(
     func=mdp.reset_stand_counter, mode="reset"
   )
@@ -78,3 +102,21 @@ def g1_getup_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.episode_length_s = 5
 
   return cfg
+
+
+def g1_getup_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Build the G1 getup environment."""
+  return _getup_smp_env_cfg(
+    g1_smp_env_cfg(play=play),
+    "datasets/pretrain_ckpt/pretrained_getup_f2s2.pt",
+    get_g1_spec_with_head,
+  )
+
+
+def x2_getup_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Build the fixed-head, 29-DoF X2 getup environment."""
+  return _getup_smp_env_cfg(
+    x2_smp_env_cfg(play=play),
+    x2_getup_ckpt_path(),
+    get_x2_getup_spec,
+  )

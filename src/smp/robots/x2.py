@@ -56,8 +56,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 X2_XML_PATH = _PROJECT_ROOT / "assets" / "robots" / "x2" / "x2_ultra.xml"
 
 
-def get_x2_spec() -> mujoco.MjSpec:
-  """Load X2, fix the head, and replace its XML motors with mjlab actuators."""
+def _build_x2_spec(*, foot_contacts_only: bool) -> mujoco.MjSpec:
+  """Load X2, fix its head, and configure collision geometry."""
   if not X2_XML_PATH.is_file():
     raise FileNotFoundError(f"X2 MJCF not found: {X2_XML_PATH}")
   spec = mujoco.MjSpec.from_file(str(X2_XML_PATH))
@@ -82,13 +82,28 @@ def get_x2_spec() -> mujoco.MjSpec:
         "left_ankle_roll_link",
         "right_ankle_roll_link",
       }
-      if geom.contype and not is_foot_contact:
-        geom.contype = 0
-        geom.conaffinity = 0
+      if geom.contype:
+        if foot_contacts_only and not is_foot_contact:
+          geom.contype = 0
+          geom.conaffinity = 0
+        elif not foot_contacts_only:
+          # Keep terrain contact while preventing overlapping robot meshes from
+          # colliding with one another during getup.
+          geom.conaffinity = 0
 
   # Scene attachment intentionally takes its timestep from SimulationCfg.
   spec.option.timestep = mujoco.MjOption().timestep
   return spec
+
+
+def get_x2_spec() -> mujoco.MjSpec:
+  """Return the fixed-head X2 locomotion spec with foot-only contacts."""
+  return _build_x2_spec(foot_contacts_only=True)
+
+
+def get_x2_spec_with_body_collisions() -> mujoco.MjSpec:
+  """Return fixed-head X2 with all body geoms able to contact terrain."""
+  return _build_x2_spec(foot_contacts_only=False)
 
 
 _HIP_PITCH_ROLL = BuiltinPositionActuatorCfg(

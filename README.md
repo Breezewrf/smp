@@ -137,7 +137,7 @@ why a wide normalizer matters.
 
 ## RL
 
-Seven downstream tasks are registered with `mjlab.tasks.registry` (importing
+Eight downstream tasks are registered with `mjlab.tasks.registry` (importing
 `smp.rl.tasks` self-registers them):
 
 | Task              | Demo | Description                              |
@@ -149,6 +149,7 @@ Seven downstream tasks are registered with `mjlab.tasks.registry` (importing
 | `Smp-Forward-X2`  | | X2 walk / jog / run at a commanded `+x` speed |
 | `Smp-Steering-X2` | | X2 target velocity + facing direction tracking |
 | `Smp-Location-X2` | | X2 world-frame xy goal tracking |
+| `Smp-Getup-X2`    | | X2 stand up from a fallen pose |
 
 ### Train / play
 
@@ -178,9 +179,19 @@ SMP_X2_CKPT=logs/pretrain/x2_lafan_loco/<timestamp>/pretrained.pt \
   uv run scripts/train.py Smp-Forward-X2 --env.scene.num-envs=4096
 ```
 
+X2 getup requires a getup-specific prior rather than the locomotion prior. By
+default it loads `datasets/pretrain_ckpt/pretrained_getup_x2.pt`; alternatively,
+point directly to another
+pretraining run:
+
+```bash
+SMP_X2_GETUP_CKPT=logs/pretrain/x2_getup/<timestamp>/pretrained.pt \
+  uv run scripts/train.py Smp-Getup-X2 --env.scene.num-envs=4096
+```
+
 The X2 RL asset physically fixes the two head joints and exposes 29 actuated
-joints. Its locomotion collision model uses the 24 foot contact points; the
-full-body visual meshes are not used for physical contact.
+joints. Its locomotion tasks use only the 24 foot contact points; the getup task
+uses full-body terrain contacts with robot self-collision disabled.
 
 ### Reward design: `task × SMP`
 
