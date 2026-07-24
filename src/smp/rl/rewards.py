@@ -5,6 +5,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from mjlab.entity import Entity
+from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.utils.lab_api.math import quat_apply_inverse
 
 from smp.rl.utils import DiffNormalizer, MotionFeatureBuffer
 
@@ -89,3 +92,55 @@ def task_smp_product(
   sole SMP-buffer update), so it must be the task's only SMP reward term."""
   task = sum(w * func(env, **kw) for func, w, kw in task_terms)
   return task * smp_guidance_reward(env, fixed_timesteps=fixed_timesteps, ws=ws)
+
+
+_DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
+
+
+def body_orientation_l2(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Return squared horizontal projected gravity for an upright-body penalty.
+
+  If asset_cfg has body_ids specified, computes the projected gravity
+  for that specific body. Otherwise, uses the root link projected gravity.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+
+  # If body_ids are specified, compute projected gravity for that body.
+  if not isinstance(asset_cfg.body_ids, slice):
+    body_quat_w = asset.data.body_link_quat_w[:, asset_cfg.body_ids, :]  # [B, N, 4]
+    if body_quat_w.shape[1] != 1:
+      raise ValueError("body_orientation_l2 expects exactly one selected body")
+    body_quat_w = body_quat_w[:, 0]
+    gravity_w = asset.data.gravity_vec_w  # [3]
+    projected_gravity_b = quat_apply_inverse(body_quat_w, gravity_w)  # [B, 3]
+    return torch.sum(torch.square(projected_gravity_b[:, :2]), dim=1)
+  else:
+    return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+
+
+def stand_still(
+  env: ManagerBasedRlEnv,
+  command_name: str | None = None,
+  command_threshold: float = 0.1,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Return squared deviation from the default joint pose.
+
+  When a command is configured, apply the penalty only for near-zero commands.
+  Getup has no command, so the penalty remains active throughout the episode.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  diff_angle = (
+    asset.data.joint_pos[:, asset_cfg.joint_ids]
+    - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+  )
+  penalty = torch.sum(torch.square(diff_angle), dim=1)
+  if command_name is not None:
+    command = env.command_manager.get_command(command_name)
+    if command is not None:
+      total_command = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+      penalty *= (total_command <= command_threshold).float()
+  return penalty

@@ -202,6 +202,21 @@ X2_HOME = EntityCfg.InitialStateCfg(
   joint_vel={".*": 0.0},
 )
 
+# Symmetric getup action offset selected from reference-motion statistics and
+# validated in the full-body-contact X2 model. The elevated root places the
+# foot contact spheres on the floor without an initial drop.
+X2_GETUP_HOME = EntityCfg.InitialStateCfg(
+  pos=(0.0, 0.0, 0.694),
+  joint_pos={
+    ".*_hip_pitch_joint": -0.25,
+    ".*_knee_joint": 0.60,
+    ".*_ankle_pitch_joint": 0.05,
+    "waist_pitch_joint": 0.30,
+    ".*_shoulder_pitch_joint": 0.196,
+  },
+  joint_vel={".*": 0.0},
+)
+
 
 def get_x2_robot_cfg() -> EntityCfg:
   """Return a fresh 29-DoF X2 configuration with a physically fixed head."""

@@ -262,10 +262,14 @@ def _smp_env_cfg(
 
   if play:
     cfg.episode_length_s = int(1e9)
+    cfg.observations["actor"].enable_corruption = False
     cfg.events.pop("push_robot", None)
     cfg.events.pop("gsi_refresh", None)
     cfg.events["init_smp_state"].params["compile_model"] = False
     cfg.events["init_smp_state"].params["gsi_buffer_size"] = 1024
+    cfg.terminations.pop("time_out", None)
+    cfg.terminations.pop("self_collision", None)
+    cfg.terminations.pop("stood_up", None)
 
   return cfg
 

@@ -5,6 +5,7 @@ from smp.robots.x2 import (
   X2_ACTION_SCALE,
   X2_CSV_JOINT_NAMES,
   X2_EE_BODY_NAMES,
+  X2_GETUP_HOME,
   X2_JOINT_NAMES,
   get_x2_robot_cfg,
 )
@@ -15,6 +16,7 @@ __all__ = [
   "X2_ACTION_SCALE",
   "X2_CSV_JOINT_NAMES",
   "X2_EE_BODY_NAMES",
+  "X2_GETUP_HOME",
   "X2_JOINT_NAMES",
   "get_x2_robot_cfg",
 ]

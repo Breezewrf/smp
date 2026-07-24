@@ -13,9 +13,9 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 
 from smp.rl.env_cfg import g1_smp_env_cfg, x2_smp_env_cfg
-from smp.rl.rewards import task_smp_product
+from smp.rl.rewards import body_orientation_l2, stand_still, task_smp_product
 from smp.rl.tasks.getup import mdp
-from smp.robots.x2 import get_x2_spec_with_body_collisions
+from smp.robots.x2 import X2_GETUP_HOME, get_x2_spec_with_body_collisions
 
 # Matches the existing ``head_collision`` geom on ``torso_link`` in g1.xml.
 HEAD_POS_IN_TORSO: tuple[float, float, float] = (0.0, 0.0, 0.43)
@@ -82,6 +82,16 @@ def _getup_smp_env_cfg(
           },
         ),
         (mdp.track_head_height, 0.3, {"target_height": 1.1, "scale": 1.0}),
+        (
+          body_orientation_l2,
+          -0.1,
+          {},
+        ),
+        (
+          stand_still,
+          -0.01,
+          {},
+        ),
       ),
     },
   )
@@ -106,17 +116,27 @@ def _getup_smp_env_cfg(
 
 def g1_getup_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   """Build the G1 getup environment."""
-  return _getup_smp_env_cfg(
+  cfg = _getup_smp_env_cfg(
     g1_smp_env_cfg(play=play),
     "datasets/pretrain_ckpt/pretrained_getup_f2s2.pt",
     get_g1_spec_with_head,
   )
+  if play:
+    cfg.auto_reset = False
+    cfg.episode_length_s = int(1e9)
+  return cfg
 
 
 def x2_getup_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   """Build the fixed-head, 29-DoF X2 getup environment."""
-  return _getup_smp_env_cfg(
+  cfg = _getup_smp_env_cfg(
     x2_smp_env_cfg(play=play),
     x2_getup_ckpt_path(),
     get_x2_getup_spec,
   )
+  cfg.scene.entities["robot"].init_state = X2_GETUP_HOME
+  cfg.sim.nconmax = 64
+  if play:
+    cfg.auto_reset = False
+    cfg.episode_length_s = int(1e9)
+  return cfg
