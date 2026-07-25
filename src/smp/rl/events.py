@@ -8,6 +8,7 @@ env-origin-relative frame, so the SMP reward is invariant to env placement.
 
 from __future__ import annotations
 
+import mujoco
 import torch
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.utils.lab_api.math import quat_apply, quat_mul, yaw_quat
@@ -42,6 +43,8 @@ def init_smp_state(
   gsi_batch_size: int = 256,
   compile_model: bool = True,
   compile_mode: str | None = None,
+  gsi_max_head_height: float | None = None,
+  gsi_max_draw_multiplier: int = 20,
   robot_name: str = "g1",
   joint_names: tuple[str, ...] = G1_JOINT_NAMES,
   ee_body_names: tuple[str, ...] = G1_EE_BODY_NAMES,
@@ -135,11 +138,27 @@ def init_smp_state(
   if gsi_buffer_size <= 0:
     msg = f"gsi_buffer_size must be positive, got {gsi_buffer_size}."
     raise ValueError(msg)
-  pool_chunks: list[torch.Tensor] = []
-  for start in range(0, gsi_buffer_size, gsi_batch_size):
-    bsz = min(gsi_batch_size, gsi_buffer_size - start)
-    pool_chunks.append(_ddpm_sample(env, bsz))
-  env._smp_gsi_pool = torch.cat(pool_chunks, dim=0)  # type: ignore[attr-defined]
+  if gsi_batch_size <= 0:
+    msg = f"gsi_batch_size must be positive, got {gsi_batch_size}."
+    raise ValueError(msg)
+  if gsi_max_draw_multiplier <= 0:
+    msg = (
+      "gsi_max_draw_multiplier must be positive, got "
+      f"{gsi_max_draw_multiplier}."
+    )
+    raise ValueError(msg)
+  env._smp_gsi_batch_size = gsi_batch_size  # type: ignore[attr-defined]
+  env._smp_gsi_max_head_height = gsi_max_head_height  # type: ignore[attr-defined]
+  env._smp_gsi_max_draw_multiplier = gsi_max_draw_multiplier  # type: ignore[attr-defined]
+  pool, head_heights = _sample_gsi_windows(
+    env,
+    gsi_buffer_size,
+    max_head_height=gsi_max_head_height,
+    batch_size=gsi_batch_size,
+    max_draw_multiplier=gsi_max_draw_multiplier,
+  )
+  env._smp_gsi_pool = pool  # type: ignore[attr-defined]
+  env._smp_gsi_head_heights = head_heights  # type: ignore[attr-defined]
 
   if compile_model and env.num_envs != gsi_batch_size:
     # Warm the reward-path shape so its Inductor compile happens here.
@@ -249,6 +268,99 @@ def _ddpm_sample(env: ManagerBasedRlEnv, n: int) -> torch.Tensor:
 
 
 @torch.no_grad()
+def _gsi_head_heights(env: ManagerBasedRlEnv, windows: torch.Tensor) -> torch.Tensor:
+  """Compute each window's final head-site height with host MuJoCo kinematics."""
+  robot = env.scene["robot"]
+  head_local_ids = robot.find_sites(["head"], preserve_order=True)[0]
+  if len(head_local_ids) != 1:
+    raise ValueError(
+      "GSI head-height filtering requires exactly one robot site named 'head'."
+    )
+
+  n = windows.shape[0]
+  parts = slice_features(
+    windows,
+    num_joints=env._smp_num_joints,  # type: ignore[attr-defined]
+    num_ee=env._smp_num_ee,  # type: ignore[attr-defined]
+  )
+  root_pos = parts["root_pos"][:, -1].detach().cpu()
+  root_rot = parts["root_rot"][:, -1]
+  root_quat = rot6d_to_quat(root_rot.reshape(n, 6)).detach().cpu()
+  joint_pos = parts["joint_pos"][:, -1].detach().cpu()
+
+  model = env.sim.mj_model
+  data = mujoco.MjData(model)
+  qpos0 = model.qpos0.copy()
+  root_q_adrs = robot.indexing.free_joint_q_adr.detach().cpu().numpy()
+  smp_joint_ids = env._smp_joint_indexes.detach().cpu()  # type: ignore[attr-defined]
+  joint_q_adrs = robot.indexing.joint_q_adr[smp_joint_ids].detach().cpu().numpy()
+  head_site_id = int(robot.indexing.site_ids[head_local_ids[0]].item())
+  heights = torch.empty(n, dtype=windows.dtype)
+
+  if len(root_q_adrs) != 7:
+    raise ValueError(
+      "GSI head-height filtering requires a floating-base robot with one free joint."
+    )
+  if len(joint_q_adrs) != env._smp_num_joints:  # type: ignore[attr-defined]
+    raise ValueError("SMP joint layout does not match the robot qpos layout.")
+
+  for i in range(n):
+    data.qpos[:] = qpos0
+    data.qpos[root_q_adrs[:3]] = root_pos[i].numpy()
+    data.qpos[root_q_adrs[3:]] = root_quat[i].numpy()
+    data.qpos[joint_q_adrs] = joint_pos[i].numpy()
+    mujoco.mj_kinematics(model, data)
+    heights[i] = float(data.site_xpos[head_site_id, 2])
+  return heights.to(device=windows.device)
+
+
+@torch.no_grad()
+def _sample_gsi_windows(
+  env: ManagerBasedRlEnv,
+  num_samples: int,
+  *,
+  max_head_height: float | None,
+  batch_size: int,
+  max_draw_multiplier: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+  """Generate a GSI pool, rejecting windows whose final head is too high."""
+  if max_head_height is None:
+    chunks = []
+    for start in range(0, num_samples, batch_size):
+      chunks.append(_ddpm_sample(env, min(batch_size, num_samples - start)))
+    return torch.cat(chunks, dim=0), None
+
+  accepted_windows: list[torch.Tensor] = []
+  accepted_heights: list[torch.Tensor] = []
+  num_accepted = 0
+  num_drawn = 0
+  max_draws = max(num_samples, num_samples * max_draw_multiplier)
+  while num_accepted < num_samples and num_drawn < max_draws:
+    draw_size = min(batch_size, max_draws - num_drawn)
+    candidates = _ddpm_sample(env, draw_size)
+    heights = _gsi_head_heights(env, candidates)
+    keep = heights < max_head_height
+    if torch.any(keep):
+      accepted_windows.append(candidates[keep])
+      accepted_heights.append(heights[keep])
+      num_accepted += int(torch.count_nonzero(keep).item())
+    num_drawn += draw_size
+
+  if num_accepted < num_samples:
+    rate = num_accepted / max(num_drawn, 1)
+    raise RuntimeError(
+      f"Only {num_accepted}/{num_samples} GSI windows with head_z < "
+      f"{max_head_height:.3f} m were accepted after {num_drawn} draws "
+      f"(acceptance rate {rate:.1%}). Increase gsi_max_draw_multiplier or "
+      "relax gsi_max_head_height."
+    )
+
+  pool = torch.cat(accepted_windows, dim=0)[:num_samples]
+  head_heights = torch.cat(accepted_heights, dim=0)[:num_samples]
+  return pool, head_heights
+
+
+@torch.no_grad()
 def gsi_refresh(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor | None = None,
@@ -268,15 +380,27 @@ def gsi_refresh(
     msg = f"num_samples ({num_samples}) cannot exceed pool size ({pool_size})"
     raise ValueError(msg)
 
-  new_windows = _ddpm_sample(env, num_samples)
+  new_windows, new_head_heights = _sample_gsi_windows(
+    env,
+    num_samples,
+    max_head_height=env._smp_gsi_max_head_height,  # type: ignore[attr-defined]
+    batch_size=env._smp_gsi_batch_size,  # type: ignore[attr-defined]
+    max_draw_multiplier=env._smp_gsi_max_draw_multiplier,  # type: ignore[attr-defined]
+  )
+  pool_head_heights: torch.Tensor | None = env._smp_gsi_head_heights  # type: ignore[attr-defined]
   head = int(getattr(env, "_smp_gsi_head", 0))
   end = head + num_samples
   if end <= pool_size:
     pool[head:end] = new_windows
+    if pool_head_heights is not None and new_head_heights is not None:
+      pool_head_heights[head:end] = new_head_heights
   else:
     first = pool_size - head
     pool[head:] = new_windows[:first]
     pool[: end - pool_size] = new_windows[first:]
+    if pool_head_heights is not None and new_head_heights is not None:
+      pool_head_heights[head:] = new_head_heights[:first]
+      pool_head_heights[: end - pool_size] = new_head_heights[first:]
   env._smp_gsi_head = end % pool_size  # type: ignore[attr-defined]
 
 
@@ -294,4 +418,11 @@ def gsi_reset(env: ManagerBasedRlEnv, env_ids: torch.Tensor | None = None) -> No
   pool: torch.Tensor = env._smp_gsi_pool  # type: ignore[attr-defined]
   idx = torch.randint(0, pool.shape[0], (n,), device=env.device)
   window = pool[idx]
+  pool_head_heights: torch.Tensor | None = env._smp_gsi_head_heights  # type: ignore[attr-defined]
+  if pool_head_heights is not None:
+    initial_head_height = getattr(env, "_getup_initial_head_height", None)
+    if initial_head_height is None:
+      initial_head_height = torch.zeros(env.num_envs, device=env.device)
+    initial_head_height[env_ids] = pool_head_heights[idx]
+    env._getup_initial_head_height = initial_head_height  # type: ignore[attr-defined]
   _prime_sim_and_buffer(env, env_ids, window)

@@ -9,6 +9,7 @@ import mujoco
 from mjlab.asset_zoo.robots.unitree_g1.g1_constants import get_spec as _get_g1_spec
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 
@@ -61,8 +62,23 @@ def _getup_smp_env_cfg(
 
   # --- Events --------------------------------------------------------------
   cfg.events["init_smp_state"].params["ckpt_path"] = ckpt_path
+  cfg.events["init_smp_state"].params["gsi_max_head_height"] = 0.9
+  gsi_reset_cfg = cfg.events.pop("gsi_reset")
+  cfg.events["record_success_by_initial_head_height"] = EventTermCfg(
+    func=mdp.record_success_by_initial_head_height,
+    mode="reset",
+    params={"bin_edges": (0.3, 0.5, 0.7, 0.9)},
+  )
+  cfg.events["gsi_reset"] = gsi_reset_cfg
   cfg.events["reset_stand_counter"] = EventTermCfg(
     func=mdp.reset_stand_counter, mode="reset"
+  )
+
+  # --- Metrics -------------------------------------------------------------
+  cfg.metrics["getup_success"] = MetricsTermCfg(
+    func=mdp.episode_success,
+    reduce="last",
+    params={"head_height": 1.2, "max_speed": 0.5, "hold_steps": 25},
   )
 
   # --- Rewards -------------------------------------------------------------
